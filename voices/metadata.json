@@ -1,0 +1,24 @@
+[
+  {
+    "id": "de18060d",
+    "name": "VV",
+    "description": "",
+    "gender": "Male",
+    "language": "Vietnamese",
+    "audio_filename": "de18060d.mp3",
+    "prompt_filename": "de18060d.pt",
+    "ref_text": "",
+    "created_at": "2026-09-11 19:54:40"
+  },
+  {
+    "id": "v_female_sample",
+    "name": "Clara (English Female)",
+    "description": "Giọng nữ thanh lịch, phát âm chuẩn tự nhiên",
+    "gender": "Female",
+    "language": "English",
+    "audio_filename": "sample_female.mp3",
+    "prompt_filename": "v_female_sample.pt",
+    "ref_text": "A soft and expressive natural female speaking voice.",
+    "created_at": "2026-09-11 19:30:00"
+  }
+]
