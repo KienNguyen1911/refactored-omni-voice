@@ -9,8 +9,10 @@ from typing import Optional, Dict, Any
 
 import soundfile as sf
 import numpy as np
+import torch
 
 from omnivoice import OmniVoiceGenerationConfig
+from omnivoice.api.forced_alignment_srt import generate_srt_from_audio_and_text_sync, merge_srt_files
 from omnivoice.api.db import (
     get_next_pending_task,
     update_task_status,
@@ -18,6 +20,9 @@ from omnivoice.api.db import (
     save_merged_batch,
     get_merged_batch,
     update_master_task_progress,
+    delete_chunk_files,
+    cleanup_expired_history,
+    cleanup_merged_chunk_files,
 )
 from omnivoice.api.audio_ops import merge_audio_files
 
@@ -36,6 +41,7 @@ class OmniVoiceTaskWorker:
         self.thread: Optional[threading.Thread] = None
         self.current_task_id: Optional[str] = None
         self._lock = threading.Lock()
+        self.last_cleanup_time = 0.0
 
     def start(self):
         with self._lock:
@@ -60,6 +66,16 @@ class OmniVoiceTaskWorker:
     def _worker_loop(self):
         while self.running:
             try:
+                # Periodic 48h history and chunk cleanup (every 30 minutes)
+                now_t = time.time()
+                if now_t - self.last_cleanup_time > 1800:
+                    self.last_cleanup_time = now_t
+                    try:
+                        cleanup_expired_history(48.0)
+                        cleanup_merged_chunk_files()
+                    except Exception as clean_err:
+                        logger.warning(f"Periodic history cleanup warning: {clean_err}")
+
                 task = get_next_pending_task()
                 if not task:
                     # Wait for next task or 1.5s timeout
@@ -85,6 +101,10 @@ class OmniVoiceTaskWorker:
 
         logger.info(f"Starting execution for Order #{order_num} ({task_id}) [{task_type}]: '{text[:40]}...'")
         update_task_status(task_id, status="processing", progress=10, started=True)
+
+        parent_id = task.get("parent_id")
+        if parent_id:
+            update_master_task_progress(parent_id)
 
         try:
             retries = 0
@@ -159,6 +179,15 @@ class OmniVoiceTaskWorker:
 
             # Generate audio on GPU
             start_time = time.time()
+
+            def on_chunk_generated(curr_c: int, tot_c: int):
+                pct = min(95, 10 + int((curr_c / tot_c) * 80))
+                update_task_status(task_id, progress=pct)
+                if parent_id:
+                    update_master_task_progress(parent_id)
+                logger.info(f"Order #{order_num} ({task_id}): Chunk {curr_c}/{tot_c} generated ({pct}%)")
+
+            kw["chunk_callback"] = on_chunk_generated
             audio = model.generate(**kw)
             elapsed = time.time() - start_time
 
@@ -169,6 +198,24 @@ class OmniVoiceTaskWorker:
             sf.write(str(output_path), audio[0], model.sampling_rate)
             duration_sec = len(audio[0]) / model.sampling_rate
 
+            # Generate synchronized SRT subtitle via Forced Alignment
+            srt_filename = output_filename.rsplit(".", 1)[0] + ".srt"
+            srt_path = OUTPUTS_DIR / srt_filename
+            srt_url = None
+            try:
+                audio_tensor = torch.from_numpy(audio[0]).float()
+                generate_srt_from_audio_and_text_sync(
+                    audio_tensor=audio_tensor,
+                    sample_rate=model.sampling_rate,
+                    text=text,
+                    language=lang,
+                    output_srt_path=str(srt_path),
+                )
+                if srt_path.exists():
+                    srt_url = f"/api/audio/output_{srt_filename}"
+            except Exception as srt_err:
+                logger.warning(f"Failed to generate SRT for Order #{order_num} ({task_id}): {srt_err}")
+
             update_task_status(
                 task_id,
                 status="completed",
@@ -177,6 +224,8 @@ class OmniVoiceTaskWorker:
                 filename=output_filename,
                 duration_sec=duration_sec,
                 generation_time_sec=elapsed,
+                srt_url=srt_url,
+                srt_filename=srt_filename if srt_url else None,
                 completed=True,
             )
             logger.info(
@@ -248,6 +297,25 @@ class OmniVoiceTaskWorker:
 
             audio_url = f"/api/audio/output_{output_filename}"
             title = f"Gộp Batch ({len(completed_tasks)} đoạn, {duration_sec:.1f}s, gap {gap_sec}s)"
+
+            # Merge SRT for the entire batch
+            batch_srt_paths = []
+            batch_durs = []
+            for t in completed_tasks:
+                s_fn = t.get("srt_filename") or (t["filename"].rsplit(".", 1)[0] + ".srt")
+                s_fp = OUTPUTS_DIR / s_fn
+                if s_fp.exists():
+                    batch_srt_paths.append(str(s_fp))
+                    batch_durs.append(float(t.get("duration_sec") or 0.0))
+
+            if batch_srt_paths and len(batch_srt_paths) == len(batch_durs):
+                try:
+                    batch_srt_filename = f"merged_{batch_id}.srt"
+                    batch_srt_path = OUTPUTS_DIR / batch_srt_filename
+                    merge_srt_files(batch_srt_paths, batch_durs, str(batch_srt_path), gap_sec=gap_sec)
+                except Exception as srt_e:
+                    logger.warning(f"Failed to merge batch SRT for {batch_id}: {srt_e}")
+
             save_merged_batch(
                 batch_id=batch_id,
                 title=title,
@@ -259,6 +327,15 @@ class OmniVoiceTaskWorker:
             )
             logger.info(
                 f"[Auto-Merge] Batch {batch_id} successfully merged -> {output_filename} (duration: {duration_sec:.2f}s)"
+            )
+
+            # Delete chunk audio and SRT files once batch merge is complete
+            keep_list = [output_filename]
+            if batch_srt_paths and len(batch_srt_paths) == len(batch_durs):
+                keep_list.append(batch_srt_filename)
+            del_count = delete_chunk_files(completed_tasks, keep_files=keep_list)
+            logger.info(
+                f"[Auto-Merge] Cleaned up {del_count} chunk files for Batch {batch_id}."
             )
         except Exception as e:
             logger.error(f"Error checking/performing auto-merge for Batch {batch_id}: {e}", exc_info=True)

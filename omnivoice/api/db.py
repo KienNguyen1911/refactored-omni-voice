@@ -2,8 +2,11 @@ import sqlite3
 import json
 import uuid
 import time
+import logging
 from pathlib import Path
 from typing import List, Dict, Optional, Any
+
+logger = logging.getLogger("omnivoice.db")
 
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "tasks.db"
@@ -59,6 +62,8 @@ def init_db():
             ("total_chunks", "INTEGER DEFAULT 1"),
             ("completed_chunks", "INTEGER DEFAULT 0"),
             ("gap_sec", "REAL DEFAULT 0.8"),
+            ("srt_url", "TEXT"),
+            ("srt_filename", "TEXT"),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE voice_tasks ADD COLUMN {col} {col_type}")
@@ -97,6 +102,14 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
+
+    # Automatically purge expired history (>48h) and any leftover merged chunk or orphaned files on startup
+    try:
+        cleanup_expired_history(retention_hours=48.0)
+        cleanup_merged_chunk_files()
+        cleanup_orphaned_outputs()
+    except Exception as cleanup_err:
+        logger.warning(f"Initial cleanup warning: {cleanup_err}")
 
 
 def _get_next_order_num(cursor: sqlite3.Cursor) -> int:
@@ -168,13 +181,14 @@ def create_task(
 
 def create_long_form_master_task(
     text: str,
-    voice_id: str,
+    voice_id: Optional[str] = None,
     voice_name: Optional[str] = None,
     language: str = "Auto",
     instruct: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     chunk_size: int = 1000,
     gap_sec: float = 0.8,
+    task_type: str = "clone",
 ) -> Dict[str, Any]:
     """
     Creates ONE master task representing the whole transcript.
@@ -212,11 +226,12 @@ def create_long_form_master_task(
                 id, order_num, task_type, text, voice_id, voice_name,
                 language, instruct, params_json, status, progress, batch_id,
                 parent_id, is_master, total_chunks, completed_chunks, gap_sec, created_at
-            ) VALUES (?, ?, 'clone', ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, 1, ?, 0, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, 1, ?, 0, ?, ?)
             """,
             (
                 master_id,
                 order_num,
+                task_type,
                 text,
                 voice_id,
                 voice_name,
@@ -244,11 +259,12 @@ def create_long_form_master_task(
                         id, order_num, task_type, text, voice_id, voice_name,
                         language, instruct, params_json, status, progress, batch_id,
                         parent_id, is_master, total_chunks, completed_chunks, gap_sec, created_at
-                    ) VALUES (?, ?, 'clone', ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, 0, 1, 0, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, 0, 1, 0, ?, ?)
                     """,
                     (
                         sub_id,
                         order_num,
+                        task_type,
                         chunk_text,
                         voice_id,
                         voice_name,
@@ -293,7 +309,16 @@ def update_master_task_progress(master_id: str) -> Optional[Dict[str, Any]]:
         total = len(sub_tasks)
         completed = sum(1 for t in sub_tasks if t["status"] == "completed")
         failed = sum(1 for t in sub_tasks if t["status"] == "failed")
-        progress = int((completed / total) * 100) if total > 0 else 0
+        
+        running_sub = next((t for t in sub_tasks if t["status"] == "processing"), None)
+        running_sub_contrib = (running_sub.get("progress", 10) / 100.0) if running_sub else 0.0
+
+        if completed == total:
+            progress = 100
+        elif total > 0:
+            progress = min(99, max(5 if (running_sub or completed > 0) else 0, int(((completed + running_sub_contrib) / total) * 100)))
+        else:
+            progress = 0
 
         now = time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -309,9 +334,12 @@ def update_master_task_progress(master_id: str) -> Optional[Dict[str, Any]]:
             gap_sec = master.get("gap_sec") or 0.8
             output_filename = f"merged_{master_id}.wav"
             output_path = OUTPUTS_DIR / output_filename
+            duration_sec = 0.0
+            audio_url = None
 
-            duration_sec, sr = merge_audio_files(file_paths, output_path, gap_sec=gap_sec)
-            audio_url = f"/api/audio/output_{output_filename}"
+            if file_paths:
+                duration_sec, sr = merge_audio_files(file_paths, output_path, gap_sec=gap_sec)
+                audio_url = f"/api/audio/output_{output_filename}"
 
             total_gen_time = round(sum(t.get("generation_time_sec") or 0.0 for t in sub_tasks), 2)
             if total_gen_time <= 0 and master.get("started_at"):
@@ -322,15 +350,54 @@ def update_master_task_progress(master_id: str) -> Optional[Dict[str, Any]]:
                 except Exception:
                     pass
 
+            # Merge SRT subtitles if present
+            srt_paths = []
+            chunk_durs = []
+            for t in sub_tasks:
+                s_fn = t.get("srt_filename") or (t.get("filename", "").rsplit(".", 1)[0] + ".srt" if t.get("filename") else None)
+                if s_fn:
+                    s_fp = OUTPUTS_DIR / s_fn
+                    if s_fp.exists():
+                        srt_paths.append(str(s_fp))
+                        chunk_durs.append(float(t.get("duration_sec") or 0.0))
+
+            master_srt_filename = f"merged_{master_id}.srt"
+            master_srt_path = OUTPUTS_DIR / master_srt_filename
+            master_srt_url = None
+            if srt_paths and len(srt_paths) == len(chunk_durs):
+                try:
+                    from omnivoice.api.forced_alignment_srt import merge_srt_files
+                    res = merge_srt_files(srt_paths, chunk_durs, str(master_srt_path), gap_sec=gap_sec)
+                    if res:
+                        master_srt_url = f"/api/audio/output_{master_srt_filename}"
+                except Exception as srt_e:
+                    logger.warning(f"Failed to merge SRTs for master task {master_id}: {srt_e}")
+
+            # Delete chunk audio and SRT files once merge is complete
+            keep_list = [output_filename]
+            if master_srt_url:
+                keep_list.append(master_srt_filename)
+            del_count = delete_chunk_files(sub_tasks, keep_files=keep_list)
+            logger.info(f"Cleaned up {del_count} chunk files for master task {master_id}.")
+
             cursor.execute(
                 """
                 UPDATE voice_tasks
                 SET status = 'completed', progress = 100, completed_chunks = ?,
                     audio_url = ?, filename = ?, duration_sec = ?, 
-                    generation_time_sec = ?, completed_at = ?
+                    generation_time_sec = ?, srt_url = ?, srt_filename = ?, completed_at = ?
                 WHERE id = ?
                 """,
-                (completed, audio_url, output_filename, duration_sec, total_gen_time, now, master_id),
+                (completed, audio_url, output_filename, duration_sec, total_gen_time, master_srt_url, master_srt_filename if master_srt_url else None, now, master_id),
+            )
+            # Clear chunk file references on sub-tasks in DB
+            cursor.execute(
+                """
+                UPDATE voice_tasks
+                SET filename = NULL, audio_url = NULL, srt_filename = NULL, srt_url = NULL
+                WHERE parent_id = ?
+                """,
+                (master_id,),
             )
         elif failed > 0 and (completed + failed == total):
             cursor.execute(
@@ -552,6 +619,8 @@ def update_task_status(
     filename: Optional[str] = None,
     duration_sec: Optional[float] = None,
     generation_time_sec: Optional[float] = None,
+    srt_url: Optional[str] = None,
+    srt_filename: Optional[str] = None,
     error_message: Optional[str] = None,
     started: bool = False,
     completed: bool = False,
@@ -577,6 +646,12 @@ def update_task_status(
     if generation_time_sec is not None:
         updates.append("generation_time_sec = ?")
         params.append(round(generation_time_sec, 2))
+    if srt_url is not None:
+        updates.append("srt_url = ?")
+        params.append(srt_url)
+    if srt_filename is not None:
+        updates.append("srt_filename = ?")
+        params.append(srt_filename)
     if error_message is not None:
         updates.append("error_message = ?")
         params.append(error_message)
@@ -638,11 +713,83 @@ def cancel_task(task_id: str) -> bool:
 def delete_task(task_id: str) -> bool:
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # 1. Collect all filenames for this task and its subtasks
+    cursor.execute(
+        "SELECT filename, srt_filename FROM voice_tasks WHERE id = ? OR parent_id = ?",
+        (task_id, task_id),
+    )
+    rows = cursor.fetchall()
+    for r in rows:
+        for f in [r["filename"], r["srt_filename"]]:
+            if f:
+                fp = OUTPUTS_DIR / f
+                if fp.exists() and fp.is_file():
+                    try:
+                        fp.unlink()
+                        logger.info(f"Deleted task file: {f}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete file {f}: {e}")
+                stem = Path(f).stem
+                for ext in [".wav", ".mp3", ".srt"]:
+                    alt = OUTPUTS_DIR / f"{stem}{ext}"
+                    if alt.exists() and alt.is_file():
+                        try:
+                            alt.unlink()
+                        except Exception:
+                            pass
+
     cursor.execute("DELETE FROM voice_tasks WHERE id = ? OR parent_id = ?", (task_id, task_id))
     affected = cursor.rowcount
     conn.commit()
     conn.close()
     return affected > 0
+
+
+def cleanup_orphaned_outputs(conn: Optional[sqlite3.Connection] = None) -> int:
+    """
+    Deletes any files in outputs/ that are not referenced by any task or merged batch in SQLite.
+    This ensures that when tasks or history are cleared, no orphaned audio or SRT files linger on disk.
+    """
+    should_close = False
+    if conn is None:
+        conn = get_db_connection()
+        should_close = True
+
+    deleted_count = 0
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT filename, srt_filename FROM voice_tasks")
+        known_files = set()
+        for r in cursor.fetchall():
+            if r["filename"]:
+                known_files.add(Path(r["filename"]).name)
+            if r["srt_filename"]:
+                known_files.add(Path(r["srt_filename"]).name)
+
+        cursor.execute("SELECT filename FROM merged_batches")
+        for r in cursor.fetchall():
+            if r["filename"]:
+                known_files.add(Path(r["filename"]).name)
+                known_files.add(Path(r["filename"]).stem + ".srt")
+
+        if OUTPUTS_DIR.exists():
+            for p in OUTPUTS_DIR.iterdir():
+                if p.is_file():
+                    if p.name not in known_files:
+                        try:
+                            p.unlink()
+                            deleted_count += 1
+                            logger.info(f"Deleted orphaned output file: {p.name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete orphaned file {p.name}: {e}")
+    except Exception as e:
+        logger.error(f"Error during cleanup_orphaned_outputs: {e}", exc_info=True)
+    finally:
+        if should_close:
+            conn.close()
+
+    return deleted_count
 
 
 def clear_completed_tasks(master_only: bool = True) -> int:
@@ -652,16 +799,69 @@ def clear_completed_tasks(master_only: bool = True) -> int:
         "SELECT id FROM voice_tasks WHERE status IN ('completed', 'failed', 'cancelled') AND (is_master = 1 OR is_master IS NULL)"
     )
     rows = cursor.fetchall()
-    if not rows:
-        conn.close()
-        return 0
+    count = 0
 
-    ids = [r[0] for r in rows]
-    placeholders = ",".join(["?"] * len(ids))
-    cursor.execute(f"DELETE FROM voice_tasks WHERE parent_id IN ({placeholders})", ids)
-    cursor.execute(f"DELETE FROM voice_tasks WHERE id IN ({placeholders})", ids)
-    count = len(ids)
+    if rows:
+        ids = [r[0] for r in rows]
+        placeholders = ",".join(["?"] * len(ids))
+
+        # 1. Find all audio and srt files of these tasks and their subtasks
+        cursor.execute(
+            f"SELECT filename, srt_filename FROM voice_tasks WHERE id IN ({placeholders}) OR parent_id IN ({placeholders})",
+            ids + ids,
+        )
+        file_rows = cursor.fetchall()
+        for r in file_rows:
+            for f in [r["filename"], r["srt_filename"]]:
+                if f:
+                    fp = OUTPUTS_DIR / f
+                    if fp.exists() and fp.is_file():
+                        try:
+                            fp.unlink()
+                            logger.info(f"Deleted task file on clear: {f}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete task file {f}: {e}")
+                    stem = Path(f).stem
+                    for ext in [".wav", ".mp3", ".srt"]:
+                        alt = OUTPUTS_DIR / f"{stem}{ext}"
+                        if alt.exists() and alt.is_file():
+                            try:
+                                alt.unlink()
+                            except Exception:
+                                pass
+
+        cursor.execute(f"DELETE FROM voice_tasks WHERE parent_id IN ({placeholders})", ids)
+        cursor.execute(f"DELETE FROM voice_tasks WHERE id IN ({placeholders})", ids)
+        count = len(ids)
+
+    # 2. Check if all tasks are cleared, also clear merged_batches
+    cursor.execute("SELECT COUNT(*) FROM voice_tasks")
+    remaining_tasks = cursor.fetchone()[0]
+    if remaining_tasks == 0:
+        cursor.execute("SELECT filename FROM merged_batches")
+        for mb in cursor.fetchall():
+            fn = mb["filename"]
+            if fn:
+                fp = OUTPUTS_DIR / fn
+                if fp.exists() and fp.is_file():
+                    try:
+                        fp.unlink()
+                    except Exception:
+                        pass
+                s_fp = OUTPUTS_DIR / (Path(fn).stem + ".srt")
+                if s_fp.exists() and s_fp.is_file():
+                    try:
+                        s_fp.unlink()
+                    except Exception:
+                        pass
+        cursor.execute("DELETE FROM merged_batches")
+
     conn.commit()
+
+    # 3. Clean up any remaining orphaned files in outputs/
+    deleted_orphans = cleanup_orphaned_outputs(conn=conn)
+    logger.info(f"clear_completed_tasks: {count} tasks deleted, {deleted_orphans} orphaned files deleted.")
+
     conn.close()
     return count
 
@@ -838,4 +1038,218 @@ def list_merged_batches(limit: int = 50) -> List[Dict[str, Any]]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def delete_chunk_files(tasks_or_filenames: List[Any], keep_files: Optional[List[str]] = None) -> int:
+    """Safely removes intermediate chunk audio (.wav, .mp3, etc.) and srt files from disk after merging."""
+    keep_names = set(Path(f).name for f in (keep_files or []))
+    deleted_count = 0
+
+    for item in tasks_or_filenames:
+        fn = None
+        srt_fn = None
+        if isinstance(item, dict):
+            fn = item.get("filename")
+            srt_fn = item.get("srt_filename")
+        elif isinstance(item, (str, Path)):
+            fn = Path(item).name
+
+        candidates = set()
+        if fn:
+            candidates.add(fn)
+            stem = Path(fn).stem
+            for ext in [".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"]:
+                candidates.add(f"{stem}{ext}")
+            if not srt_fn:
+                candidates.add(f"{stem}.srt")
+        if srt_fn:
+            candidates.add(srt_fn)
+
+        for candidate in candidates:
+            if candidate in keep_names:
+                continue
+            fp = OUTPUTS_DIR / candidate
+            if fp.exists() and fp.is_file():
+                try:
+                    fp.unlink()
+                    deleted_count += 1
+                    logger.info(f"Deleted chunk file: {candidate}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete chunk file {candidate}: {e}")
+
+    return deleted_count
+
+
+def cleanup_merged_chunk_files() -> int:
+    """Scans and deletes any leftover chunk files for tasks or batches that have already been merged."""
+    conn = get_db_connection()
+    deleted_total = 0
+    try:
+        cursor = conn.cursor()
+        # 1. Clean up sub-tasks of completed master tasks
+        cursor.execute(
+            "SELECT id, filename, srt_filename FROM voice_tasks WHERE status = 'completed' AND is_master = 1"
+        )
+        masters = cursor.fetchall()
+        for m in masters:
+            m_id = m["id"]
+            keep_files = [f for f in [m["filename"], m["srt_filename"]] if f]
+            cursor.execute(
+                "SELECT filename, srt_filename FROM voice_tasks WHERE parent_id = ?",
+                (m_id,),
+            )
+            subs = [dict(r) for r in cursor.fetchall()]
+            if subs:
+                deleted_total += delete_chunk_files(subs, keep_files=keep_files)
+                cursor.execute(
+                    "UPDATE voice_tasks SET filename = NULL, audio_url = NULL, srt_filename = NULL, srt_url = NULL WHERE parent_id = ?",
+                    (m_id,),
+                )
+
+        # 2. Clean up chunk files of merged batches
+        cursor.execute("SELECT batch_id, filename FROM merged_batches")
+        batches = cursor.fetchall()
+        for b in batches:
+            b_id = b["batch_id"]
+            if not b_id:
+                continue
+            keep_files = [b["filename"], Path(b["filename"]).stem + ".srt"]
+            cursor.execute(
+                "SELECT filename, srt_filename FROM voice_tasks WHERE batch_id = ?",
+                (b_id,),
+            )
+            batch_tasks = [dict(r) for r in cursor.fetchall()]
+            if batch_tasks:
+                deleted_total += delete_chunk_files(batch_tasks, keep_files=keep_files)
+                cursor.execute(
+                    "UPDATE voice_tasks SET filename = NULL, audio_url = NULL, srt_filename = NULL, srt_url = NULL WHERE batch_id = ?",
+                    (b_id,),
+                )
+
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error cleaning up merged chunk files: {e}", exc_info=True)
+    finally:
+        conn.close()
+
+    return deleted_total
+
+
+def cleanup_expired_history(retention_hours: float = 48.0) -> Dict[str, int]:
+    """
+    Purges task records and merged batches older than retention_hours (default 48h).
+    Also deletes their associated audio (.wav, .mp3) and subtitle (.srt) files from disk,
+    as well as any orphaned files in outputs/ older than retention_hours.
+    """
+    from datetime import datetime, timedelta
+
+    cutoff_dt = datetime.now() - timedelta(hours=retention_hours)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_epoch = time.time() - (retention_hours * 3600)
+
+    conn = get_db_connection()
+    deleted_tasks_count = 0
+    deleted_batches_count = 0
+    deleted_files_count = 0
+
+    try:
+        cursor = conn.cursor()
+
+        # 1. Expired voice_tasks
+        cursor.execute(
+            "SELECT id, filename, srt_filename FROM voice_tasks WHERE created_at < ?",
+            (cutoff_str,),
+        )
+        expired_tasks = cursor.fetchall()
+        for row in expired_tasks:
+            for f in [row["filename"], row["srt_filename"]]:
+                if f:
+                    fp = OUTPUTS_DIR / f
+                    if fp.exists() and fp.is_file():
+                        try:
+                            fp.unlink()
+                            deleted_files_count += 1
+                        except Exception as e:
+                            logger.warning(f"Error removing expired task file {f}: {e}")
+                    stem = Path(f).stem
+                    for ext in [".wav", ".mp3", ".srt"]:
+                        alt_fp = OUTPUTS_DIR / f"{stem}{ext}"
+                        if alt_fp.exists() and alt_fp.is_file():
+                            try:
+                                alt_fp.unlink()
+                                deleted_files_count += 1
+                            except Exception:
+                                pass
+
+        if expired_tasks:
+            task_ids = [r["id"] for r in expired_tasks]
+            for i in range(0, len(task_ids), 100):
+                batch = task_ids[i : i + 100]
+                placeholders = ",".join(["?"] * len(batch))
+                cursor.execute(f"DELETE FROM voice_tasks WHERE id IN ({placeholders})", batch)
+            deleted_tasks_count = len(task_ids)
+
+        # 2. Expired merged_batches
+        cursor.execute(
+            "SELECT id, filename FROM merged_batches WHERE created_at < ?",
+            (cutoff_str,),
+        )
+        expired_batches = cursor.fetchall()
+        for row in expired_batches:
+            fn = row["filename"]
+            if fn:
+                fp = OUTPUTS_DIR / fn
+                if fp.exists() and fp.is_file():
+                    try:
+                        fp.unlink()
+                        deleted_files_count += 1
+                    except Exception as e:
+                        logger.warning(f"Error removing expired batch file {fn}: {e}")
+                # Also check srt
+                s_fp = OUTPUTS_DIR / (Path(fn).stem + ".srt")
+                if s_fp.exists() and s_fp.is_file():
+                    try:
+                        s_fp.unlink()
+                        deleted_files_count += 1
+                    except Exception as e:
+                        logger.warning(f"Error removing expired batch srt {s_fp.name}: {e}")
+
+        if expired_batches:
+            b_ids = [r["id"] for r in expired_batches]
+            placeholders = ",".join(["?"] * len(b_ids))
+            cursor.execute(f"DELETE FROM merged_batches WHERE id IN ({placeholders})", b_ids)
+            deleted_batches_count = len(b_ids)
+
+        conn.commit()
+
+        # 3. Clean up any leftover or orphaned files in outputs/ older than retention_hours
+        orphans_del = cleanup_orphaned_outputs(conn=conn)
+        deleted_files_count += orphans_del
+
+        if OUTPUTS_DIR.exists():
+            for p in OUTPUTS_DIR.iterdir():
+                if p.is_file():
+                    try:
+                        mtime = p.stat().st_mtime
+                        if mtime < cutoff_epoch:
+                            p.unlink()
+                            deleted_files_count += 1
+                            logger.info(f"Removed expired output file: {p.name} (age > {retention_hours}h)")
+                    except Exception as e:
+                        logger.warning(f"Error checking/removing old output file {p.name}: {e}")
+
+        logger.info(
+            f"[History Retention] Purged records older than {retention_hours}h: "
+            f"{deleted_tasks_count} tasks, {deleted_batches_count} batches, {deleted_files_count} files removed."
+        )
+    except Exception as e:
+        logger.error(f"Error during expired history cleanup: {e}", exc_info=True)
+    finally:
+        conn.close()
+
+    return {
+        "deleted_tasks": deleted_tasks_count,
+        "deleted_batches": deleted_batches_count,
+        "deleted_files": deleted_files_count,
+    }
 

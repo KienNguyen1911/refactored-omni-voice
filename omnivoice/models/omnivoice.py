@@ -34,7 +34,7 @@ import os
 import re
 from dataclasses import dataclass, fields
 from functools import partial
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
 import torch
@@ -601,6 +601,7 @@ class OmniVoice(PreTrainedModel):
         speed: Union[float, list[Optional[float]], None] = None,
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
         normalize_text: bool = False,
+        chunk_callback: Optional[Callable[[int, int], None]] = None,
         **kwargs,
     ) -> list[np.ndarray]:
         """Generate speech audio given text in various modes.
@@ -709,7 +710,9 @@ class OmniVoice(PreTrainedModel):
 
         if long_idx:
             long_task = full_task.slice_task(long_idx)
-            long_results = self._generate_chunked(long_task, gen_config)
+            long_results = self._generate_chunked(
+                long_task, gen_config, chunk_callback=chunk_callback
+            )
             for idx, res in zip(long_idx, long_results):
                 results[idx] = res
 
@@ -911,7 +914,10 @@ class OmniVoice(PreTrainedModel):
         return generated_audio
 
     def _generate_chunked(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+        self,
+        task: GenerationTask,
+        gen_config: OmniVoiceGenerationConfig,
+        chunk_callback: Optional[Callable[[int, int], None]] = None,
     ) -> List[List[torch.Tensor]]:
         """Generate long audio by splitting text into chunks and batching.
 
@@ -923,6 +929,7 @@ class OmniVoice(PreTrainedModel):
                 estimated audio exceeds ``audio_chunk_threshold``.
             gen_config: Generation config (``audio_chunk_duration`` controls
                 chunk size).
+            chunk_callback: Optional callback called as `chunk_callback(current_chunk, total_chunks)`.
         Returns:
             Per-item list of chunk token-tensor lists.
         """
@@ -995,6 +1002,11 @@ class OmniVoice(PreTrainedModel):
                     ref_audios=[task.ref_audio_tokens[i] for i in indices],
                     ref_texts=[task.ref_texts[i] for i in indices],
                 )
+                if chunk_callback is not None:
+                    try:
+                        chunk_callback(ci + 1, max_num_chunks)
+                    except Exception as cb_err:
+                        logger.warning(f"chunk_callback error: {cb_err}")
         else:
             # No reference audio — generate chunk 0 for all items first,
             # then use chunk 0 output as reference for all subsequent chunks.
@@ -1006,6 +1018,11 @@ class OmniVoice(PreTrainedModel):
                 ref_texts=[None] * len(indices_0),
             )
             first_chunk_map = {idx: chunk_results[idx][0] for idx in indices_0}
+            if chunk_callback is not None:
+                try:
+                    chunk_callback(1, max_num_chunks)
+                except Exception as cb_err:
+                    logger.warning(f"chunk_callback error: {cb_err}")
 
             # Batch all remaining chunks, using chunk 0 as fixed reference
             for ci in range(1, max_num_chunks):
@@ -1018,6 +1035,11 @@ class OmniVoice(PreTrainedModel):
                     ref_audios=[first_chunk_map[i] for i in indices],
                     ref_texts=[all_chunks[i][0] for i in indices],
                 )
+                if chunk_callback is not None:
+                    try:
+                        chunk_callback(ci + 1, max_num_chunks)
+                    except Exception as cb_err:
+                        logger.warning(f"chunk_callback error: {cb_err}")
 
         return chunk_results
 

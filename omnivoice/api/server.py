@@ -38,9 +38,18 @@ from omnivoice.api.db import (
     save_merged_batch,
     get_merged_batch,
     list_merged_batches,
+    delete_chunk_files,
+    cleanup_merged_chunk_files,
+    cleanup_expired_history,
 )
 from omnivoice.api.task_worker import OmniVoiceTaskWorker
 from omnivoice.api.audio_ops import split_text_by_sentence_chunks, merge_audio_files
+from omnivoice.api.forced_alignment_srt import (
+    generate_srt_from_audio_and_text_sync,
+    export_voice_with_srt,
+    get_ffmpeg_path,
+    merge_srt_files,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("omnivoice.api")
@@ -74,8 +83,14 @@ model_state = {
 
 
 def get_model():
-    if model_state["model"] is None and not model_state["is_loading"]:
-        load_model()
+    if model_state["model"] is None:
+        if not model_state["is_loading"]:
+            load_model()
+        else:
+            for _ in range(60):
+                if not model_state["is_loading"] or model_state["model"] is not None:
+                    break
+                time.sleep(0.5)
     return model_state["model"]
 
 
@@ -214,7 +229,8 @@ def delete_voice_endpoint(voice_id: str):
 
 class CreateTaskRequest(BaseModel):
     task_type: str = "clone"  # 'clone' or 'design'
-    text: str
+    text: Optional[str] = None
+    transcript: Optional[str] = None  # Alias for text
     voice_id: Optional[str] = None
     voice_name: Optional[str] = None
     language: Optional[str] = "Auto"
@@ -227,6 +243,8 @@ class CreateTaskRequest(BaseModel):
     preprocess_prompt: Optional[bool] = True
     postprocess_output: Optional[bool] = True
     ref_text: Optional[str] = None
+    gap_sec: Optional[float] = 0.8
+    chunk_size: Optional[int] = 1000
 
 
 class BatchItem(BaseModel):
@@ -254,8 +272,9 @@ class CreateBatchTasksRequest(BaseModel):
 
 @app.post("/api/tasks")
 def create_single_task(req: CreateTaskRequest):
-    if not req.text or not req.text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    input_text = (req.transcript or req.text or "").strip()
+    if not input_text:
+        raise HTTPException(status_code=400, detail="Transcript / text cannot be empty.")
 
     if req.task_type == "clone" and not req.voice_id:
         raise HTTPException(status_code=400, detail="voice_id is required for clone tasks.")
@@ -278,12 +297,33 @@ def create_single_task(req: CreateTaskRequest):
         "preprocess_prompt": req.preprocess_prompt,
         "postprocess_output": req.postprocess_output,
         "ref_text": req.ref_text,
+        "gap_sec": req.gap_sec or 0.8,
     }
+
+    # Automatically chunk long transcripts into a master task with auto-merged audio and SRT!
+    if len(input_text) > 800:
+        try:
+            master_task = create_long_form_master_task(
+                text=input_text,
+                voice_id=req.voice_id or "",
+                voice_name=voice_name,
+                language=req.language or "Auto",
+                instruct=req.instruct,
+                params=params,
+                chunk_size=req.chunk_size or 1000,
+                gap_sec=req.gap_sec or 0.8,
+                task_type=req.task_type,
+            )
+            task_worker.trigger()
+            return master_task
+        except Exception as e:
+            logger.error(f"Failed to create chunked master task: {e}")
+            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
     try:
         task = create_task(
             task_type=req.task_type,
-            text=req.text.strip(),
+            text=input_text,
             voice_id=req.voice_id,
             voice_name=voice_name,
             language=req.language or "Auto",
@@ -295,6 +335,20 @@ def create_single_task(req: CreateTaskRequest):
     except Exception as e:
         logger.error(f"Failed to create task: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.post("/api/tasks/clone")
+def create_clone_task(req: CreateTaskRequest):
+    """Convenience endpoint: create a voice clone task with transcript (auto-chunks if long, outputs MP3/WAV + SRT)."""
+    req.task_type = "clone"
+    return create_single_task(req)
+
+
+@app.post("/api/tasks/design")
+def create_design_task(req: CreateTaskRequest):
+    """Convenience endpoint: create a voice design task from text and instruct prompt (auto-chunks if long, outputs MP3/WAV + SRT)."""
+    req.task_type = "design"
+    return create_single_task(req)
 
 
 @app.post("/api/tasks/batch")
@@ -584,6 +638,28 @@ def merge_tasks_endpoint(req: MergeTasksRequest):
         duration_sec, sr = merge_audio_files(file_paths, out_path, gap_sec=req.gap_sec)
         audio_url = f"/api/audio/output_{out_name}"
 
+        # Merge SRT files if available
+        srt_paths = []
+        chunk_durs = []
+        for t in completed_tasks:
+            s_fn = t.get("srt_filename") or (t["filename"].rsplit(".", 1)[0] + ".srt" if t.get("filename") else None)
+            if s_fn:
+                s_fp = OUTPUTS_DIR / s_fn
+                if s_fp.exists():
+                    srt_paths.append(str(s_fp))
+                    chunk_durs.append(float(t.get("duration_sec") or 0.0))
+
+        out_srt_name = out_name.rsplit(".", 1)[0] + ".srt"
+        out_srt_path = OUTPUTS_DIR / out_srt_name
+        merged_srt_ok = False
+        if srt_paths and len(srt_paths) == len(chunk_durs):
+            try:
+                res_srt = merge_srt_files(srt_paths, chunk_durs, str(out_srt_path), gap_sec=req.gap_sec)
+                if res_srt:
+                    merged_srt_ok = True
+            except Exception as srt_e:
+                logger.warning(f"Failed to merge SRTs in merge endpoint: {srt_e}")
+
         # Save record in SQLite
         batch_id = completed_tasks[0].get("batch_id") or f"custom_{uuid.uuid4().hex[:8]}"
         save_merged_batch(
@@ -596,6 +672,13 @@ def merge_tasks_endpoint(req: MergeTasksRequest):
             gap_sec=req.gap_sec,
         )
 
+        # Delete chunk audio and chunk SRT files
+        keep_list = [out_name]
+        if merged_srt_ok:
+            keep_list.append(out_srt_name)
+        del_count = delete_chunk_files(completed_tasks, keep_files=keep_list)
+        logger.info(f"Cleaned up {del_count} chunk files after manual merge.")
+
         return {
             "status": "success",
             "audio_url": audio_url,
@@ -604,10 +687,21 @@ def merge_tasks_endpoint(req: MergeTasksRequest):
             "chunks_count": len(file_paths),
             "gap_sec": req.gap_sec,
             "sampling_rate": sr,
+            "srt_url": f"/api/audio/output_{out_srt_name}" if merged_srt_ok else None,
+            "deleted_chunks": del_count,
         }
     except Exception as e:
         logger.error(f"Failed to merge audio files: {e}")
         raise HTTPException(status_code=500, detail=f"Merge error: {str(e)}")
+
+
+@app.post("/api/tasks/cleanup")
+def cleanup_history_endpoint(hours: float = Query(48.0, ge=1.0, le=720.0)):
+    """Triggers cleanup of history older than 48 hours and any leftover chunk files."""
+    del_chunks = cleanup_merged_chunk_files()
+    hist_stats = cleanup_expired_history(retention_hours=hours)
+    hist_stats["deleted_chunk_files"] = del_chunks
+    return {"status": "success", **hist_stats}
 
 
 @app.get("/api/batches/merged")
@@ -745,6 +839,24 @@ def generate_clone(req: CloneRequest):
     sf.write(str(output_path), audio[0], model.sampling_rate)
     duration_sec = len(audio[0]) / model.sampling_rate
 
+    # Generate SRT via Forced Alignment
+    srt_filename = output_filename.rsplit(".", 1)[0] + ".srt"
+    srt_path = OUTPUTS_DIR / srt_filename
+    srt_url = None
+    try:
+        audio_tensor = torch.from_numpy(audio[0]).float()
+        generate_srt_from_audio_and_text_sync(
+            audio_tensor=audio_tensor,
+            sample_rate=model.sampling_rate,
+            text=req.text,
+            language=lang,
+            output_srt_path=str(srt_path),
+        )
+        if srt_path.exists():
+            srt_url = f"/api/audio/output_{srt_filename}"
+    except Exception as srt_e:
+        logger.warning(f"Failed to generate SRT for clone task {task_id}: {srt_e}")
+
     # Update SQLite task record as completed
     update_task_status(
         task_id,
@@ -754,6 +866,8 @@ def generate_clone(req: CloneRequest):
         filename=output_filename,
         duration_sec=duration_sec,
         generation_time_sec=elapsed,
+        srt_url=srt_url,
+        srt_filename=srt_filename if srt_url else None,
         completed=True,
     )
 
@@ -763,6 +877,7 @@ def generate_clone(req: CloneRequest):
         "order_num": task.get("order_num"),
         "audio_url": f"/api/audio/output_{output_filename}",
         "filename": output_filename,
+        "srt_url": srt_url,
         "duration_sec": round(duration_sec, 2),
         "generation_time_sec": round(elapsed, 2),
         "text": req.text,
@@ -839,6 +954,24 @@ def generate_design(req: DesignRequest):
     sf.write(str(output_path), audio[0], model.sampling_rate)
     duration_sec = len(audio[0]) / model.sampling_rate
 
+    # Generate SRT via Forced Alignment
+    srt_filename = output_filename.rsplit(".", 1)[0] + ".srt"
+    srt_path = OUTPUTS_DIR / srt_filename
+    srt_url = None
+    try:
+        audio_tensor = torch.from_numpy(audio[0]).float()
+        generate_srt_from_audio_and_text_sync(
+            audio_tensor=audio_tensor,
+            sample_rate=model.sampling_rate,
+            text=req.text,
+            language=lang,
+            output_srt_path=str(srt_path),
+        )
+        if srt_path.exists():
+            srt_url = f"/api/audio/output_{srt_filename}"
+    except Exception as srt_e:
+        logger.warning(f"Failed to generate SRT for design task {task_id}: {srt_e}")
+
     update_task_status(
         task_id,
         status="completed",
@@ -847,6 +980,8 @@ def generate_design(req: DesignRequest):
         filename=output_filename,
         duration_sec=duration_sec,
         generation_time_sec=elapsed,
+        srt_url=srt_url,
+        srt_filename=srt_filename if srt_url else None,
         completed=True,
     )
 
@@ -856,12 +991,138 @@ def generate_design(req: DesignRequest):
         "order_num": task.get("order_num"),
         "audio_url": f"/api/audio/output_{output_filename}",
         "filename": output_filename,
+        "srt_url": srt_url,
         "duration_sec": round(duration_sec, 2),
         "generation_time_sec": round(elapsed, 2),
         "text": req.text,
         "instruct": req.instruct,
         "sampling_rate": model.sampling_rate,
     }
+
+
+class TTSWithSubtitlesRequest(BaseModel):
+    text: str
+    voice_id: Optional[str] = None
+    language: str = "vi"
+    instruct: Optional[str] = None
+    speed: Optional[float] = 1.0
+    num_step: int = 16
+    guidance_scale: float = 2.0
+
+
+@app.post("/api/tts/generate-with-subtitles")
+def generate_with_subtitles(req: TTSWithSubtitlesRequest):
+    """Generate speech along with synchronized SRT subtitles and optional MP3."""
+    model = get_model()
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model is still loading, please wait.")
+
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+    take_id = f"sub_{uuid.uuid4().hex[:10]}"
+    gen_config = OmniVoiceGenerationConfig(
+        num_step=int(req.num_step or 16),
+        guidance_scale=float(req.guidance_scale or 2.0),
+    )
+
+    lang = req.language if (req.language and req.language != "Auto") else None
+
+    kw: Dict[str, Any] = {
+        "text": req.text.strip(),
+        "language": lang,
+        "generation_config": gen_config,
+    }
+
+    if req.speed is not None and float(req.speed) != 1.0:
+        kw["speed"] = float(req.speed)
+    if req.instruct and req.instruct.strip():
+        kw["instruct"] = req.instruct.strip()
+
+    if req.voice_id:
+        prompt, audio_path, store_ref_text = voice_store.get_prompt_or_audio(req.voice_id, model=model)
+        if prompt is not None:
+            kw["voice_clone_prompt"] = prompt
+        elif audio_path is not None:
+            kw["ref_audio"] = audio_path
+            kw["ref_text"] = store_ref_text or None
+        else:
+            raise HTTPException(status_code=404, detail="Voice file not found")
+    elif not kw.get("instruct"):
+        kw["instruct"] = "Clear natural voice"
+
+    try:
+        audio = model.generate(**kw)
+    except Exception as e:
+        logger.error(f"Generation error in generate_with_subtitles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    audio_tensor = torch.from_numpy(audio[0]).float()
+    export_res = export_voice_with_srt(
+        audio_tensor=audio_tensor,
+        sample_rate=model.sampling_rate,
+        text=req.text.strip(),
+        output_dir=str(OUTPUTS_DIR),
+        base_name=take_id,
+        language=lang,
+    )
+
+    audio_file = f"{take_id}.mp3" if export_res["mp3_path"] else f"{take_id}.wav"
+    return {
+        "id": take_id,
+        "status": "success",
+        "audio_url": f"/api/audio/output_{audio_file}",
+        "srt_url": f"/api/audio/output_{take_id}.srt",
+        "has_mp3": export_res["mp3_path"] is not None,
+        "srt_content": export_res.get("srt_content", ""),
+    }
+
+
+@app.post("/api/tasks/{task_id}/generate-srt")
+def generate_task_srt(task_id: str):
+    """Generate or re-generate SRT subtitle file for an existing task."""
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    filename = task.get("filename")
+    if not filename:
+        raise HTTPException(status_code=400, detail="Task has no audio file yet")
+    audio_path = OUTPUTS_DIR / filename
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file not found on disk")
+
+    text = task.get("text", "")
+    lang = task.get("language")
+    if not lang or lang == "Auto":
+        lang = None
+
+    try:
+        audio_data, sr = sf.read(str(audio_path))
+        if audio_data.ndim > 1:
+            audio_data = audio_data[:, 0]
+        audio_tensor = torch.from_numpy(audio_data).float()
+
+        srt_filename = filename.rsplit(".", 1)[0] + ".srt"
+        srt_path = OUTPUTS_DIR / srt_filename
+        srt_content = generate_srt_from_audio_and_text_sync(
+            audio_tensor=audio_tensor,
+            sample_rate=sr,
+            text=text,
+            language=lang,
+            output_srt_path=str(srt_path),
+        )
+        srt_url = f"/api/audio/output_{srt_filename}"
+        update_task_status(task_id, status=task["status"], srt_url=srt_url, srt_filename=srt_filename)
+        return {
+            "status": "success",
+            "task_id": task_id,
+            "srt_url": srt_url,
+            "srt_filename": srt_filename,
+            "srt_content": srt_content,
+        }
+    except Exception as e:
+        logger.error(f"Failed to generate SRT for task {task_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/audio/{filename}")
@@ -880,9 +1141,20 @@ def serve_audio(filename: str):
         actual_name = filename.replace("output_", "")
         target_path = OUTPUTS_DIR / actual_name
         if target_path.exists():
+            suffix = target_path.suffix.lower()
+            if suffix == ".srt":
+                return FileResponse(
+                    str(target_path),
+                    media_type="text/plain; charset=utf-8",
+                    filename=actual_name,
+                    headers={"Content-Disposition": f'attachment; filename="{actual_name}"'},
+                )
+            elif suffix == ".mp3":
+                return FileResponse(str(target_path), media_type="audio/mpeg", filename=actual_name)
             return FileResponse(str(target_path), media_type="audio/wav")
 
     raise HTTPException(status_code=404, detail="Audio file not found")
+
 
 
 def main():
