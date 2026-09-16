@@ -1,5 +1,38 @@
 [
   {
+    "id": "df7cf3f8",
+    "name": "Seyana Seya (ElevenLabs)",
+    "description": "[Characters Animation] A versatile professional voice actor, capable of a wide range of expressions, from bright and energetic anime-style vocals to calm, professional narration. Perfect for gaming content, character acting, and creative storytelling. Clear, expressive, and ready to bring your project to life.",
+    "gender": "Unspecified",
+    "language": "Japanese",
+    "audio_filename": "df7cf3f8.mp3",
+    "prompt_filename": "df7cf3f8.pt",
+    "ref_text": "古代のエルドリアの地、空が輝き、森が風に秘密をささやく場所に、ゼフィロスという名のドラゴンが住んでいました。[sarcastically] 「全部燃やし尽くす」タイプではなくて…[giggles] 彼は優しく、賢く、目はまるで古い星のようでした。[whispers] 彼が通ると鳥たちも静かになりました。",
+    "created_at": "2026-09-16 22:15:41"
+  },
+  {
+    "id": "81c2f9d1",
+    "name": "Russell (British Docu)",
+    "description": "[Entertainment] Fast paced, deep & serious British Documentary Narrator for dramatic subjects. For TV, News, Radio, YouTube & Social Media.",
+    "gender": "Unspecified",
+    "language": "English",
+    "audio_filename": "81c2f9d1.mp3",
+    "prompt_filename": "81c2f9d1.pt",
+    "ref_text": "In the ancient land of Eldoria, where skies shimmered and forests, whispered secrets to the wind, lived a dragon named Zephyros. [sarcastically] Not the “burn it all down” kind... [giggles] but he was gentle, wise, with eyes like old stars. [whispers] Even the birds fell silent when he passed.",
+    "created_at": "2026-09-16 21:02:53"
+  },
+  {
+    "id": "cd245f24",
+    "name": "Daniel (ElevenLabs)",
+    "description": "[Entertainment] Daniel - Middle-aged male Polish voice with a great accent and quality. Ideal for news, audiobooks and advertising or promotional videos.",
+    "gender": "Male",
+    "language": "Polish",
+    "audio_filename": "cd245f24.mp3",
+    "prompt_filename": "cd245f24.pt",
+    "ref_text": "W starożytnej krainie Eldoria, gdzie niebo migotało, a lasy szeptały tajemnice wiatrowi, żył smok o imieniu Zephyros. [sarcastically] Nie taki, co wszystko podpala... [giggles] ale był łagodny, mądry, z oczami jak stare gwiazdy. [whispers] Nawet ptaki milczały, gdy przechodził.",
+    "created_at": "2026-09-16 20:47:30"
+  },
+  {
     "id": "22df2b61",
     "name": "gxi ame",
     "description": "",

@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import uuid
 import time
 import logging
@@ -226,6 +227,74 @@ def delete_voice_endpoint(voice_id: str):
     if not success:
         raise HTTPException(status_code=404, detail="Voice not found")
     return {"status": "deleted", "id": voice_id}
+
+
+class ElevenLabsFetchRequest(BaseModel):
+    url: str
+
+
+class ElevenLabsCloneRequest(BaseModel):
+    url: str
+    name: Optional[str] = None
+    gender: Optional[str] = None
+    language: Optional[str] = None
+    description: Optional[str] = None
+    ref_text: Optional[str] = None
+    preview_url: Optional[str] = None
+
+
+@app.post("/api/voices/elevenlabs/fetch-info")
+def fetch_elevenlabs_info_endpoint(req: ElevenLabsFetchRequest):
+    try:
+        from omnivoice.utils.elevenlabs import fetch_elevenlabs_voice_info
+        info = fetch_elevenlabs_voice_info(req.url)
+        return info
+    except Exception as e:
+        logger.error(f"Error fetching ElevenLabs voice: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/voices/elevenlabs/clone")
+def clone_elevenlabs_voice_endpoint(req: ElevenLabsCloneRequest):
+    try:
+        from omnivoice.utils.elevenlabs import fetch_elevenlabs_voice_info, download_elevenlabs_audio
+        
+        preview_url = req.preview_url
+        name = req.name
+        gender = req.gender
+        language = req.language
+        description = req.description
+        ref_text = req.ref_text
+
+        # If preview_url or any detail missing, fetch directly from page
+        if not preview_url or not name:
+            info = fetch_elevenlabs_voice_info(req.url)
+            preview_url = preview_url or info["preview_url"]
+            name = name or info["name"]
+            gender = gender or info["gender"]
+            language = language or info["language"]
+            description = description if description is not None else info["description"]
+            ref_text = ref_text if ref_text is not None else info["ref_text"]
+
+        logger.info(f"Downloading ElevenLabs audio for voice '{name}' from {preview_url}...")
+        audio_bytes = download_elevenlabs_audio(preview_url)
+
+        model = get_model()
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name.strip().lower())
+        new_voice = voice_store.add_voice(
+            name=name.strip(),
+            audio_data=audio_bytes,
+            filename=f"elevenlabs_{safe_name}.mp3",
+            gender=gender or "Unspecified",
+            language=language or "Auto",
+            description=(description or "").strip(),
+            ref_text=(ref_text or "").strip() or None,
+            model=model,
+        )
+        return new_voice
+    except Exception as e:
+        logger.error(f"Error cloning ElevenLabs voice: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------

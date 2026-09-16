@@ -194,6 +194,58 @@ export async function deleteVoice(voiceId: string): Promise<void> {
   if (!res.ok) throw new Error("Failed to delete voice");
 }
 
+export interface ElevenLabsVoiceInfo {
+  voice_id: string;
+  name: string;
+  description: string;
+  gender: string;
+  language: string;
+  preview_url: string;
+  ref_text: string;
+  source_url: string;
+  available_languages?: Array<{
+    code: string;
+    label: string;
+    preview_url: string;
+  }>;
+}
+
+export interface CloneElevenLabsParams {
+  url: string;
+  name?: string;
+  gender?: string;
+  language?: string;
+  description?: string;
+  ref_text?: string;
+  preview_url?: string;
+}
+
+export async function fetchElevenLabsVoiceInfo(url: string): Promise<ElevenLabsVoiceInfo> {
+  const res = await fetch(`${API_BASE}/api/voices/elevenlabs/fetch-info`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || "Không thể lấy thông tin giọng từ ElevenLabs");
+  }
+  return res.json();
+}
+
+export async function cloneElevenLabsVoice(params: CloneElevenLabsParams): Promise<Voice> {
+  const res = await fetch(`${API_BASE}/api/voices/elevenlabs/clone`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || "Không thể clone giọng từ ElevenLabs");
+  }
+  return res.json();
+}
+
 // ---------------------------------------------------------------------------
 // Task and Queue API
 // ---------------------------------------------------------------------------
