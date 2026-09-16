@@ -13,12 +13,24 @@
   &nbsp;
   <a href="https://zhu-han.github.io/omnivoice"><img src="https://img.shields.io/badge/GitHub.io-Demo_Page-blue?logo=GitHub&style=flat-square"></a>
   &nbsp;
-  <a href="https://colab.research.google.com/github/k2-fsa/OmniVoice/blob/master/docs/OmniVoice.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
+  <a href="https://colab.research.google.com/github/KienNguyen1911/refactored-omni-voice/blob/master/OmniVoice_Colab.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
 </p>
 
-OmniVoice is a state-of-the-art massively multilingual zero-shot text-to-speech (TTS) model supporting over 600 languages. Built on a novel diffusion language model-style architecture, it generates high-quality speech with superior inference speed, supporting voice cloning and voice design.
+OmniVoice is a state-of-the-art massively multilingual zero-shot text-to-speech (TTS) model supporting over 600 languages. Built on a novel diffusion language model-style architecture, it generates high-quality speech with superior inference speed, supporting voice cloning, voice design, and a modern desktop & web UI studio.
 
-**Contents**: [Key Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start) | [Python API](#python-api) | [Command-Line Tools](#command-line-tools) | [Training & Evaluation](#training--evaluation) | [Discussion](#discussion--communication) | [Citation](#citation)
+**Contents**: [🚀 Google Colab](#-google-colab-quickstart) | [Key Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start) | [Python API](#python-api) | [Command-Line Tools](#command-line-tools) | [Training & Evaluation](#training--evaluation) | [Discussion](#discussion--communication) | [Citation](#citation)
+
+---
+
+## 🚀 Google Colab Quickstart
+
+Run **OmniVoice Studio (Web UI & API)** on a free Google Colab GPU (T4):
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/KienNguyen1911/refactored-omni-voice/blob/master/OmniVoice_Colab.ipynb)
+
+1. Open [OmniVoice_Colab.ipynb](OmniVoice_Colab.ipynb) in Colab.
+2. Select **Runtime -> Change runtime type -> T4 GPU**.
+3. Run the **1-Click Launch** cell to automatically set up environment and receive a public Cloudflare Tunnel URL to open the Web UI!
 
 ## Key Features
 
