@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import soundfile as sf
 import numpy as np
@@ -131,11 +132,15 @@ def startup_event():
     # Start background task processor
     task_worker.start()
 
-    # Attempt to load model on startup
-    try:
-        load_model()
-    except Exception as e:
-        logger.warning(f"Could not load model on startup: {e}. Will retry on demand.")
+    # Load model asynchronously in background thread so server & UI appear immediately!
+    import threading
+    def _async_load():
+        try:
+            load_model()
+            logger.info("OmniVoice model loaded successfully in background.")
+        except Exception as e:
+            logger.warning(f"Could not load model on startup: {e}. Will retry on demand.")
+    threading.Thread(target=_async_load, daemon=True, name="ModelLoaderThread").start()
 
 
 @app.on_event("shutdown")
@@ -1155,6 +1160,19 @@ def serve_audio(filename: str):
 
     raise HTTPException(status_code=404, detail="Audio file not found")
 
+
+# Mount static web UI (look in web/out or web_dist)
+web_candidates = [
+    Path(__file__).resolve().parent.parent.parent / "web" / "out",
+    Path(__file__).resolve().parent / "web_dist",
+    Path("web/out"),
+    Path("web_dist"),
+]
+for candidate in web_candidates:
+    if candidate.exists() and (candidate / "index.html").exists():
+        logger.info(f"Serving Static Web UI from: {candidate.resolve()}")
+        app.mount("/", StaticFiles(directory=str(candidate), html=True), name="web_ui")
+        break
 
 
 def main():

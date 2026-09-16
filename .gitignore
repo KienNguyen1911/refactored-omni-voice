@@ -28,3 +28,22 @@ examples/exp*
 .claude/
 *.wav
 *.jsonl
+
+# Web frontend & node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Desktop & runtime artifacts
+outputs/
+dist_installer/
+*.log
+*.sqlite
+*.sqlite3
+
+# IDE & OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
