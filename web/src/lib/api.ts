@@ -27,6 +27,16 @@ export interface BackendHealth {
   gpu_name: string;
   sampling_rate: number;
   current_task_id?: string | null;
+  concurrency?: number;
+  max_concurrency?: number;
+  active_workers?: number;
+}
+
+export interface WorkerSettings {
+  concurrency: number;
+  max_concurrency: number;
+  active_workers: number;
+  current_task_id?: string | null;
 }
 
 export interface GenerationResult {
@@ -505,6 +515,27 @@ export async function triggerCleanup(hours: number = 48.0): Promise<{
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || "Failed to trigger cleanup");
+  }
+  return res.json();
+}
+
+export async function fetchWorkerSettings(): Promise<WorkerSettings> {
+  const res = await fetch(`${API_BASE}/api/worker/settings`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch worker settings: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function updateWorkerConcurrency(concurrency: number): Promise<WorkerSettings> {
+  const res = await fetch(`${API_BASE}/api/worker/settings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ concurrency }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to update worker concurrency: ${res.statusText}`);
   }
   return res.json();
 }

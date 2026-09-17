@@ -9,6 +9,8 @@ import {
   fetchVoices,
   fetchHealth,
   fetchTaskStats,
+  fetchWorkerSettings,
+  updateWorkerConcurrency,
 } from "@/lib/api";
 import VoiceLibrary from "@/components/VoiceLibrary";
 import VoiceCloneStudio from "@/components/VoiceCloneStudio";
@@ -26,6 +28,7 @@ import {
   Loader2,
   Cpu,
   Code2,
+  Zap,
 } from "lucide-react";
 
 export default function Home() {
@@ -37,12 +40,24 @@ export default function Home() {
   const [health, setHealth] = useState<BackendHealth | null>(null);
   const [currentAudioResult, setCurrentAudioResult] = useState<GenerationResult | null>(null);
   const [taskStats, setTaskStats] = useState<TaskStats | null>(null);
+  const [concurrency, setConcurrency] = useState<number>(1);
+  const [isUpdatingConcurrency, setIsUpdatingConcurrency] = useState<boolean>(false);
 
-  // Load health, voices, and task stats
+  // Load health, voices, task stats, and worker settings
   useEffect(() => {
+    // Check localStorage cache for initial instant render
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("omnivoice_concurrency");
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        if (parsed >= 1 && parsed <= 5) setConcurrency(parsed);
+      }
+    }
+
     loadHealth();
     loadVoices();
     loadStats();
+    loadWorkerSettings();
 
     const interval = setInterval(() => {
       loadHealth();
@@ -51,10 +66,46 @@ export default function Home() {
     return () => clearInterval(interval);
   }, []);
 
+  const loadWorkerSettings = async () => {
+    try {
+      const ws = await fetchWorkerSettings();
+      if (ws?.concurrency) {
+        setConcurrency(ws.concurrency);
+        if (typeof window !== "undefined") {
+          localStorage.setItem("omnivoice_concurrency", String(ws.concurrency));
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSetConcurrency = async (num: number) => {
+    if (num === concurrency || isUpdatingConcurrency) return;
+    const prev = concurrency;
+    setConcurrency(num);
+    setIsUpdatingConcurrency(true);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("omnivoice_concurrency", String(num));
+    }
+    try {
+      await updateWorkerConcurrency(num);
+      await loadHealth();
+    } catch (err) {
+      console.error("Failed to update worker concurrency:", err);
+      setConcurrency(prev);
+    } finally {
+      setIsUpdatingConcurrency(false);
+    }
+  };
+
   const loadHealth = async () => {
     try {
       const h = await fetchHealth();
       setHealth(h);
+      if (h?.concurrency && h.concurrency >= 1 && h.concurrency <= 5) {
+        setConcurrency(h.concurrency);
+      }
     } catch {
       setHealth(null);
     }
@@ -88,6 +139,7 @@ export default function Home() {
 
   const isWorkerBusy = (taskStats?.processing || 0) > 0;
   const hasPendingTasks = (taskStats?.pending || 0) > 0;
+  const activeWorkersCount = health?.active_workers ?? taskStats?.processing ?? 0;
 
   return (
     <div className="h-screen max-h-screen bg-[#08090b] text-[#f1f3f7] flex flex-col font-sans overflow-hidden">
@@ -185,15 +237,59 @@ export default function Home() {
             </button>
           </nav>
 
-          {/* Backend / GPU Status Badge */}
-          <div className="hidden md:flex items-center gap-2">
-            <div className="flex items-center gap-2 px-2.5 py-1 rounded bg-[#08090b] border border-[#1e222b] text-[11px] font-mono">
+          {/* Header Right: Concurrency Control & Backend / GPU Status Badge */}
+          <div className="flex items-center gap-2.5">
+            {/* Multi-thread Concurrency Selector (1 to 5 threads) */}
+            <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[#08090b] border border-[#1e222b] text-xs shadow-sm">
+              <div
+                className="flex items-center gap-1 text-slate-300 text-[11px] font-medium select-none"
+                title="Số luồng tác vụ chạy đồng thời (Tối đa 5 luồng)"
+              >
+                <Zap className="w-3.5 h-3.5 text-amber-400" />
+                <span className="hidden lg:inline text-slate-300 font-mono text-[11px]">Luồng:</span>
+              </div>
+
+              <div className="flex items-center gap-0.5 bg-[#12151b] p-0.5 rounded border border-[#1c202a]">
+                {[1, 2, 3, 4, 5].map((num) => {
+                  const isSelected = concurrency === num;
+                  return (
+                    <button
+                      key={num}
+                      type="button"
+                      onClick={() => handleSetConcurrency(num)}
+                      disabled={isUpdatingConcurrency}
+                      title={`Cài đặt chạy tối đa ${num} luồng song song (1 - 5 luồng)`}
+                      className={`w-5.5 h-5 rounded flex items-center justify-center text-[11px] font-mono font-semibold transition-all cursor-pointer ${
+                        isSelected
+                          ? "bg-blue-600 text-white shadow-sm shadow-blue-500/30 scale-105"
+                          : "text-slate-400 hover:text-slate-200 hover:bg-[#1a1e27]"
+                      }`}
+                    >
+                      {num}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {activeWorkersCount > 0 && (
+                <span
+                  className="hidden sm:flex items-center gap-1 ml-0.5 px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-500/10 text-amber-300 border border-amber-500/20"
+                  title={`${activeWorkersCount} luồng đang xử lý tác vụ`}
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                  <span>{activeWorkersCount} bận</span>
+                </span>
+              )}
+            </div>
+
+            {/* Backend / GPU Status Badge */}
+            <div className="hidden md:flex items-center gap-2 px-2.5 py-1 rounded bg-[#08090b] border border-[#1e222b] text-[11px] font-mono">
               <span
                 className={`w-1.5 h-1.5 rounded-full ${
                   health?.status === "online" ? "bg-emerald-400 animate-pulse" : "bg-rose-400"
                 }`}
               />
-              <span className="text-slate-300 truncate max-w-[220px]">
+              <span className="text-slate-300 truncate max-w-[200px]">
                 {health?.status === "online"
                   ? `${health.gpu_name} (24kHz)`
                   : "Đang kết nối backend..."}

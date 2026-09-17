@@ -3,6 +3,7 @@ import json
 import uuid
 import time
 import logging
+import threading
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 
@@ -12,6 +13,9 @@ DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "tasks.db"
 OUTPUTS_DIR = Path("outputs")
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+_db_claim_lock = threading.Lock()
+_master_progress_lock = threading.Lock()
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -92,6 +96,15 @@ def init_db():
         )
         """)
 
+        # Create table for system settings (concurrency, etc.)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """)
+
         # Reset any tasks stuck in 'processing' when server was shut down/restarted
         cursor.execute("""
         UPDATE voice_tasks 
@@ -110,6 +123,37 @@ def init_db():
         cleanup_orphaned_outputs()
     except Exception as cleanup_err:
         logger.warning(f"Initial cleanup warning: {cleanup_err}")
+
+
+def get_system_setting(key: str, default: Any = None) -> Any:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM system_settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        if row and row[0] is not None:
+            return row[0]
+        return default
+    finally:
+        conn.close()
+
+
+def set_system_setting(key: str, value: Any) -> None:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(
+            """
+            INSERT INTO system_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, str(value), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _get_next_order_num(cursor: sqlite3.Cursor) -> int:
@@ -291,140 +335,143 @@ def update_master_task_progress(master_id: str) -> Optional[Dict[str, Any]]:
     """
     from omnivoice.api.audio_ops import merge_audio_files
 
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM voice_tasks WHERE id = ?", (master_id,))
-        master_row = cursor.fetchone()
-        if not master_row:
-            return None
-        master = dict(master_row)
+    with _master_progress_lock:
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM voice_tasks WHERE id = ?", (master_id,))
+            master_row = cursor.fetchone()
+            if not master_row:
+                return None
+            master = dict(master_row)
+            if master.get("status") == "completed":
+                return master
 
-        cursor.execute("SELECT * FROM voice_tasks WHERE parent_id = ? ORDER BY rowid ASC", (master_id,))
-        sub_rows = cursor.fetchall()
-        if not sub_rows:
-            return master
+            cursor.execute("SELECT * FROM voice_tasks WHERE parent_id = ? ORDER BY rowid ASC", (master_id,))
+            sub_rows = cursor.fetchall()
+            if not sub_rows:
+                return master
 
-        sub_tasks = [dict(r) for r in sub_rows]
-        total = len(sub_tasks)
-        completed = sum(1 for t in sub_tasks if t["status"] == "completed")
-        failed = sum(1 for t in sub_tasks if t["status"] == "failed")
-        
-        running_sub = next((t for t in sub_tasks if t["status"] == "processing"), None)
-        running_sub_contrib = (running_sub.get("progress", 10) / 100.0) if running_sub else 0.0
+            sub_tasks = [dict(r) for r in sub_rows]
+            total = len(sub_tasks)
+            completed = sum(1 for t in sub_tasks if t["status"] == "completed")
+            failed = sum(1 for t in sub_tasks if t["status"] == "failed")
+            
+            running_sub = next((t for t in sub_tasks if t["status"] == "processing"), None)
+            running_sub_contrib = (running_sub.get("progress", 10) / 100.0) if running_sub else 0.0
 
-        if completed == total:
-            progress = 100
-        elif total > 0:
-            progress = min(99, max(5 if (running_sub or completed > 0) else 0, int(((completed + running_sub_contrib) / total) * 100)))
-        else:
-            progress = 0
+            if completed == total:
+                progress = 100
+            elif total > 0:
+                progress = min(99, max(5 if (running_sub or completed > 0) else 0, int(((completed + running_sub_contrib) / total) * 100)))
+            else:
+                progress = 0
 
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # If all sub-chunks are completed, merge audio!
-        if completed == total:
-            file_paths = []
-            for t in sub_tasks:
-                if t.get("filename"):
-                    fp = OUTPUTS_DIR / t["filename"]
-                    if fp.exists():
-                        file_paths.append(fp)
+            # If all sub-chunks are completed, merge audio!
+            if completed == total:
+                file_paths = []
+                for t in sub_tasks:
+                    if t.get("filename"):
+                        fp = OUTPUTS_DIR / t["filename"]
+                        if fp.exists():
+                            file_paths.append(fp)
 
-            gap_sec = master.get("gap_sec") or 0.8
-            output_filename = f"merged_{master_id}.wav"
-            output_path = OUTPUTS_DIR / output_filename
-            duration_sec = 0.0
-            audio_url = None
+                gap_sec = master.get("gap_sec") or 0.8
+                output_filename = f"merged_{master_id}.wav"
+                output_path = OUTPUTS_DIR / output_filename
+                duration_sec = 0.0
+                audio_url = None
 
-            if file_paths:
-                duration_sec, sr = merge_audio_files(file_paths, output_path, gap_sec=gap_sec)
-                audio_url = f"/api/audio/output_{output_filename}"
+                if file_paths:
+                    duration_sec, sr = merge_audio_files(file_paths, output_path, gap_sec=gap_sec)
+                    audio_url = f"/api/audio/output_{output_filename}"
 
-            total_gen_time = round(sum(t.get("generation_time_sec") or 0.0 for t in sub_tasks), 2)
-            if total_gen_time <= 0 and master.get("started_at"):
-                try:
-                    t_start = time.mktime(time.strptime(master["started_at"], "%Y-%m-%d %H:%M:%S"))
-                    t_end = time.mktime(time.strptime(now, "%Y-%m-%d %H:%M:%S"))
-                    total_gen_time = round(max(0.0, t_end - t_start), 2)
-                except Exception:
-                    pass
+                total_gen_time = round(sum(t.get("generation_time_sec") or 0.0 for t in sub_tasks), 2)
+                if total_gen_time <= 0 and master.get("started_at"):
+                    try:
+                        t_start = time.mktime(time.strptime(master["started_at"], "%Y-%m-%d %H:%M:%S"))
+                        t_end = time.mktime(time.strptime(now, "%Y-%m-%d %H:%M:%S"))
+                        total_gen_time = round(max(0.0, t_end - t_start), 2)
+                    except Exception:
+                        pass
 
-            # Merge SRT subtitles if present
-            srt_paths = []
-            chunk_durs = []
-            for t in sub_tasks:
-                s_fn = t.get("srt_filename") or (t.get("filename", "").rsplit(".", 1)[0] + ".srt" if t.get("filename") else None)
-                if s_fn:
-                    s_fp = OUTPUTS_DIR / s_fn
-                    if s_fp.exists():
-                        srt_paths.append(str(s_fp))
-                        chunk_durs.append(float(t.get("duration_sec") or 0.0))
+                # Merge SRT subtitles if present
+                srt_paths = []
+                chunk_durs = []
+                for t in sub_tasks:
+                    s_fn = t.get("srt_filename") or (t.get("filename", "").rsplit(".", 1)[0] + ".srt" if t.get("filename") else None)
+                    if s_fn:
+                        s_fp = OUTPUTS_DIR / s_fn
+                        if s_fp.exists():
+                            srt_paths.append(str(s_fp))
+                            chunk_durs.append(float(t.get("duration_sec") or 0.0))
 
-            master_srt_filename = f"merged_{master_id}.srt"
-            master_srt_path = OUTPUTS_DIR / master_srt_filename
-            master_srt_url = None
-            if srt_paths and len(srt_paths) == len(chunk_durs):
-                try:
-                    from omnivoice.api.forced_alignment_srt import merge_srt_files
-                    res = merge_srt_files(srt_paths, chunk_durs, str(master_srt_path), gap_sec=gap_sec)
-                    if res:
-                        master_srt_url = f"/api/audio/output_{master_srt_filename}"
-                except Exception as srt_e:
-                    logger.warning(f"Failed to merge SRTs for master task {master_id}: {srt_e}")
+                master_srt_filename = f"merged_{master_id}.srt"
+                master_srt_path = OUTPUTS_DIR / master_srt_filename
+                master_srt_url = None
+                if srt_paths and len(srt_paths) == len(chunk_durs):
+                    try:
+                        from omnivoice.api.forced_alignment_srt import merge_srt_files
+                        res = merge_srt_files(srt_paths, chunk_durs, str(master_srt_path), gap_sec=gap_sec)
+                        if res:
+                            master_srt_url = f"/api/audio/output_{master_srt_filename}"
+                    except Exception as srt_e:
+                        logger.warning(f"Failed to merge SRTs for master task {master_id}: {srt_e}")
 
-            # Delete chunk audio and SRT files once merge is complete
-            keep_list = [output_filename]
-            if master_srt_url:
-                keep_list.append(master_srt_filename)
-            del_count = delete_chunk_files(sub_tasks, keep_files=keep_list)
-            logger.info(f"Cleaned up {del_count} chunk files for master task {master_id}.")
+                # Delete chunk audio and SRT files once merge is complete
+                keep_list = [output_filename]
+                if master_srt_url:
+                    keep_list.append(master_srt_filename)
+                del_count = delete_chunk_files(sub_tasks, keep_files=keep_list)
+                logger.info(f"Cleaned up {del_count} chunk files for master task {master_id}.")
 
-            cursor.execute(
-                """
-                UPDATE voice_tasks
-                SET status = 'completed', progress = 100, completed_chunks = ?,
-                    audio_url = ?, filename = ?, duration_sec = ?, 
-                    generation_time_sec = ?, srt_url = ?, srt_filename = ?, completed_at = ?
-                WHERE id = ?
-                """,
-                (completed, audio_url, output_filename, duration_sec, total_gen_time, master_srt_url, master_srt_filename if master_srt_url else None, now, master_id),
-            )
-            # Clear chunk file references on sub-tasks in DB
-            cursor.execute(
-                """
-                UPDATE voice_tasks
-                SET filename = NULL, audio_url = NULL, srt_filename = NULL, srt_url = NULL
-                WHERE parent_id = ?
-                """,
-                (master_id,),
-            )
-        elif failed > 0 and (completed + failed == total):
-            cursor.execute(
-                """
-                UPDATE voice_tasks
-                SET status = 'failed', progress = ?, completed_chunks = ?,
-                    error_message = ?, completed_at = ?
-                WHERE id = ?
-                """,
-                (progress, completed, f"{failed} đoạn bị lỗi", now, master_id),
-            )
-        else:
-            # Still in progress
-            cursor.execute(
-                """
-                UPDATE voice_tasks
-                SET status = 'processing', progress = ?, completed_chunks = ?,
-                    started_at = COALESCE(started_at, ?)
-                WHERE id = ?
-                """,
-                (progress, completed, now, master_id),
-            )
+                cursor.execute(
+                    """
+                    UPDATE voice_tasks
+                    SET status = 'completed', progress = 100, completed_chunks = ?,
+                        audio_url = ?, filename = ?, duration_sec = ?, 
+                        generation_time_sec = ?, srt_url = ?, srt_filename = ?, completed_at = ?
+                    WHERE id = ?
+                    """,
+                    (completed, audio_url, output_filename, duration_sec, total_gen_time, master_srt_url, master_srt_filename if master_srt_url else None, now, master_id),
+                )
+                # Clear chunk file references on sub-tasks in DB
+                cursor.execute(
+                    """
+                    UPDATE voice_tasks
+                    SET filename = NULL, audio_url = NULL, srt_filename = NULL, srt_url = NULL
+                    WHERE parent_id = ?
+                    """,
+                    (master_id,),
+                )
+            elif failed > 0 and (completed + failed == total):
+                cursor.execute(
+                    """
+                    UPDATE voice_tasks
+                    SET status = 'failed', progress = ?, completed_chunks = ?,
+                        error_message = ?, completed_at = ?
+                    WHERE id = ?
+                    """,
+                    (progress, completed, f"{failed} đoạn bị lỗi", now, master_id),
+                )
+            else:
+                # Still in progress
+                cursor.execute(
+                    """
+                    UPDATE voice_tasks
+                    SET status = 'processing', progress = ?, completed_chunks = ?,
+                        started_at = COALESCE(started_at, ?)
+                    WHERE id = ?
+                    """,
+                    (progress, completed, now, master_id),
+                )
 
-        conn.commit()
-        return get_task(master_id, conn=conn)
-    finally:
-        conn.close()
+            conn.commit()
+            return get_task(master_id, conn=conn)
+        finally:
+            conn.close()
 
 
 def create_batch_tasks(
@@ -579,6 +626,45 @@ def list_tasks(
 
     conn.close()
     return tasks
+
+
+def claim_next_pending_task() -> Optional[Dict[str, Any]]:
+    """Atomically finds and claims the earliest pending task to execute.
+    Sets status='processing', progress=10, started_at=now in a serialized lock
+    so multiple concurrent worker threads never claim the same task.
+    """
+    with _db_claim_lock:
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id FROM voice_tasks 
+                WHERE status = 'pending' AND (is_master = 0 OR total_chunks = 1 OR total_chunks IS NULL)
+                ORDER BY order_num ASC, rowid ASC 
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            task_id = row[0]
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                """
+                UPDATE voice_tasks
+                SET status = 'processing', progress = 10, started_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, task_id),
+            )
+            if cursor.rowcount == 0:
+                conn.rollback()
+                return None
+            conn.commit()
+            return get_task(task_id, conn=conn)
+        finally:
+            conn.close()
 
 
 def get_next_pending_task() -> Optional[Dict[str, Any]]:

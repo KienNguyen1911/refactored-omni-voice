@@ -43,6 +43,8 @@ from omnivoice.api.db import (
     delete_chunk_files,
     cleanup_merged_chunk_files,
     cleanup_expired_history,
+    get_system_setting,
+    set_system_setting,
 )
 from omnivoice.api.task_worker import OmniVoiceTaskWorker
 from omnivoice.api.audio_ops import split_text_by_sentence_chunks, merge_audio_files
@@ -120,16 +122,20 @@ def load_model():
         model_state["is_loading"] = False
 
 
+# Initialize SQLite database schema
+init_db()
+saved_concurrency = int(get_system_setting("concurrency", 1) or 1)
+
 # Background worker instance
-task_worker = OmniVoiceTaskWorker(get_model, voice_store)
+task_worker = OmniVoiceTaskWorker(get_model, voice_store, max_workers=saved_concurrency)
+
+
+class WorkerSettingsRequest(BaseModel):
+    concurrency: int
 
 
 @app.on_event("startup")
 def startup_event():
-    # Initialize SQLite database
-    init_db()
-    logger.info("SQLite database initialized.")
-
     # Start background task processor
     task_worker.start()
 
@@ -164,6 +170,34 @@ def health_check():
         "device": model_state["device"] or "pending",
         "gpu_name": gpu_name,
         "sampling_rate": model_state["model"].sampling_rate if model_state["model"] else 24000,
+        "current_task_id": task_worker.current_task_id,
+        "concurrency": task_worker.max_workers,
+        "max_concurrency": 5,
+        "active_workers": task_worker.active_workers_count,
+    }
+
+
+@app.get("/api/worker/settings")
+def get_worker_settings():
+    return {
+        "concurrency": task_worker.max_workers,
+        "max_concurrency": 5,
+        "active_workers": task_worker.active_workers_count,
+        "current_task_id": task_worker.current_task_id,
+    }
+
+
+@app.post("/api/worker/settings")
+def update_worker_settings(req: WorkerSettingsRequest):
+    if req.concurrency < 1 or req.concurrency > 5:
+        raise HTTPException(status_code=400, detail="Số luồng (concurrency) phải từ 1 đến 5.")
+    actual = task_worker.set_concurrency(req.concurrency)
+    set_system_setting("concurrency", str(actual))
+    logger.info(f"Updated task worker concurrency to {actual} (persisted in database).")
+    return {
+        "concurrency": actual,
+        "max_concurrency": 5,
+        "active_workers": task_worker.active_workers_count,
         "current_task_id": task_worker.current_task_id,
     }
 

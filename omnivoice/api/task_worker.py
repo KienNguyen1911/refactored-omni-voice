@@ -5,7 +5,7 @@ import uuid
 import logging
 import threading
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import soundfile as sf
 import numpy as np
@@ -14,6 +14,7 @@ import torch
 from omnivoice import OmniVoiceGenerationConfig
 from omnivoice.api.forced_alignment_srt import generate_srt_from_audio_and_text_sync, merge_srt_files
 from omnivoice.api.db import (
+    claim_next_pending_task,
     get_next_pending_task,
     update_task_status,
     get_tasks_by_batch_id,
@@ -31,75 +32,148 @@ logger = logging.getLogger("omnivoice.worker")
 OUTPUTS_DIR = Path("outputs")
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
+_batch_merge_lock = threading.Lock()
+
 
 class OmniVoiceTaskWorker:
-    def __init__(self, get_model_func, voice_store_instance):
+    def __init__(self, get_model_func, voice_store_instance, max_workers: int = 1):
         self.get_model = get_model_func
         self.voice_store = voice_store_instance
-        self.wake_event = threading.Event()
+        self.max_workers = max(1, min(5, int(max_workers)))
         self.running = False
-        self.thread: Optional[threading.Thread] = None
-        self.current_task_id: Optional[str] = None
         self._lock = threading.Lock()
+        self.cv = threading.Condition(self._lock)
+        self.threads: Dict[int, threading.Thread] = {}
+        self.active_tasks: Dict[int, Optional[str]] = {}
         self.last_cleanup_time = 0.0
+
+    @property
+    def current_task_id(self) -> Optional[str]:
+        """Returns the first active task id, or None (for backward compatibility)."""
+        with self._lock:
+            for tid in self.active_tasks.values():
+                if tid:
+                    return tid
+            return None
+
+    @property
+    def active_workers_count(self) -> int:
+        """Returns the number of currently active task executions."""
+        with self._lock:
+            return sum(1 for tid in self.active_tasks.values() if tid)
 
     def start(self):
         with self._lock:
             if self.running:
                 return
             self.running = True
-            self.thread = threading.Thread(target=self._worker_loop, daemon=True, name="OmniVoiceWorker")
-            self.thread.start()
-            logger.info("OmniVoice SQLite Task Worker thread started.")
+            for i in range(1, self.max_workers + 1):
+                t = threading.Thread(
+                    target=self._worker_loop,
+                    args=(i,),
+                    daemon=True,
+                    name=f"OmniVoiceWorker-{i}",
+                )
+                self.threads[i] = t
+                t.start()
+            logger.info(f"OmniVoice Task Worker pool started with {self.max_workers} thread(s).")
 
     def stop(self):
         with self._lock:
             self.running = False
-            self.wake_event.set()
-        if self.thread:
-            self.thread.join(timeout=3.0)
+            self.cv.notify_all()
+        threads = list(self.threads.values())
+        for t in threads:
+            if t.is_alive():
+                t.join(timeout=2.0)
+        self.threads.clear()
+        self.active_tasks.clear()
+        logger.info("OmniVoice Task Workers stopped.")
 
     def trigger(self):
-        """Wakes up the worker immediately when a new task is inserted"""
-        self.wake_event.set()
+        """Wakes up all waiting idle workers immediately when a new task is inserted"""
+        with self.cv:
+            self.cv.notify_all()
 
-    def _worker_loop(self):
+    def set_concurrency(self, new_count: int) -> int:
+        """Dynamically adjusts the number of concurrent worker threads (1-5)."""
+        new_count = max(1, min(5, int(new_count)))
+        with self._lock:
+            old_count = self.max_workers
+            self.max_workers = new_count
+            logger.info(f"Task worker concurrency updated: {old_count} -> {new_count}")
+
+            if self.running:
+                # If increasing, spawn workers for new slots
+                for i in range(1, new_count + 1):
+                    t = self.threads.get(i)
+                    if t is None or not t.is_alive():
+                        t = threading.Thread(
+                            target=self._worker_loop,
+                            args=(i,),
+                            daemon=True,
+                            name=f"OmniVoiceWorker-{i}",
+                        )
+                        self.threads[i] = t
+                        t.start()
+
+        # Wake up workers (new ones to start claiming tasks, or excess ones to retire)
+        with self.cv:
+            self.cv.notify_all()
+        return self.max_workers
+
+    def _worker_loop(self, worker_id: int):
+        logger.info(f"Worker thread #{worker_id} started.")
         while self.running:
-            try:
-                # Periodic 48h history and chunk cleanup (every 30 minutes)
-                now_t = time.time()
-                if now_t - self.last_cleanup_time > 1800:
-                    self.last_cleanup_time = now_t
-                    try:
-                        cleanup_expired_history(48.0)
-                        cleanup_merged_chunk_files()
-                    except Exception as clean_err:
-                        logger.warning(f"Periodic history cleanup warning: {clean_err}")
+            # Check if concurrency was reduced and this worker slot should retire
+            with self._lock:
+                if worker_id > self.max_workers:
+                    logger.info(f"Worker thread #{worker_id} gracefully retiring (concurrency={self.max_workers}).")
+                    self.active_tasks.pop(worker_id, None)
+                    self.threads.pop(worker_id, None)
+                    break
 
-                task = get_next_pending_task()
+            try:
+                # Periodic 48h history and chunk cleanup (handled by worker 1 only)
+                if worker_id == 1:
+                    now_t = time.time()
+                    if now_t - self.last_cleanup_time > 1800:
+                        self.last_cleanup_time = now_t
+                        try:
+                            cleanup_expired_history(48.0)
+                            cleanup_merged_chunk_files()
+                        except Exception as clean_err:
+                            logger.warning(f"Periodic history cleanup warning: {clean_err}")
+
+                # Atomically claim the next pending task
+                task = claim_next_pending_task()
                 if not task:
-                    # Wait for next task or 1.5s timeout
-                    self.wake_event.wait(timeout=1.5)
-                    self.wake_event.clear()
+                    with self.cv:
+                        # Wait for next task trigger or 1.5s timeout
+                        self.cv.wait(timeout=1.5)
                     continue
 
                 task_id = task["id"]
-                self.current_task_id = task_id
-                self._process_task(task)
+                with self._lock:
+                    self.active_tasks[worker_id] = task_id
+
+                self._process_task(task, worker_id=worker_id)
+
             except Exception as e:
-                logger.error(f"Worker loop uncaught error: {e}", exc_info=True)
+                logger.error(f"Worker #{worker_id} loop uncaught error: {e}", exc_info=True)
                 time.sleep(1.0)
             finally:
-                self.current_task_id = None
+                with self._lock:
+                    self.active_tasks[worker_id] = None
 
-    def _process_task(self, task: Dict[str, Any]):
+    def _process_task(self, task: Dict[str, Any], worker_id: int = 1):
         task_id = task["id"]
         order_num = task.get("order_num", 0)
         task_type = task["task_type"]
         text = task["text"]
         params = task.get("params", {}) or {}
 
-        logger.info(f"Starting execution for Order #{order_num} ({task_id}) [{task_type}]: '{text[:40]}...'")
+        logger.info(f"[Worker #{worker_id}] Executing Order #{order_num} ({task_id}) [{task_type}]: '{text[:40]}...'")
         update_task_status(task_id, status="processing", progress=10, started=True)
 
         parent_id = task.get("parent_id")
@@ -264,78 +338,79 @@ class OmniVoiceTaskWorker:
 
     def _check_batch_completion(self, batch_id: str, params: Dict[str, Any]):
         """Checks if all tasks in the batch are finished, and auto-merges them if requested"""
-        try:
-            auto_merge = params.get("auto_merge", True)
-            if not auto_merge:
-                return
+        with _batch_merge_lock:
+            try:
+                auto_merge = params.get("auto_merge", True)
+                if not auto_merge:
+                    return
 
-            existing = get_merged_batch(batch_id)
-            if existing:
-                return
+                existing = get_merged_batch(batch_id)
+                if existing:
+                    return
 
-            tasks = get_tasks_by_batch_id(batch_id)
-            if not tasks:
-                return
+                tasks = get_tasks_by_batch_id(batch_id)
+                if not tasks:
+                    return
 
-            all_done = all(t["status"] in ("completed", "failed", "cancelled") for t in tasks)
-            if not all_done:
-                return
+                all_done = all(t["status"] in ("completed", "failed", "cancelled") for t in tasks)
+                if not all_done:
+                    return
 
-            completed_tasks = [t for t in tasks if t["status"] == "completed" and t.get("filename")]
-            if not completed_tasks:
-                return
+                completed_tasks = [t for t in tasks if t["status"] == "completed" and t.get("filename")]
+                if not completed_tasks:
+                    return
 
-            gap_sec = float(params.get("gap_sec", 0.8) or 0.8)
-            file_paths = [OUTPUTS_DIR / t["filename"] for t in completed_tasks]
-            output_filename = f"merged_{batch_id}.wav"
-            output_path = OUTPUTS_DIR / output_filename
+                gap_sec = float(params.get("gap_sec", 0.8) or 0.8)
+                file_paths = [OUTPUTS_DIR / t["filename"] for t in completed_tasks]
+                output_filename = f"merged_{batch_id}.wav"
+                output_path = OUTPUTS_DIR / output_filename
 
-            logger.info(
-                f"[Auto-Merge] Batch {batch_id} finished! Merging {len(completed_tasks)} tasks with gap {gap_sec}s..."
-            )
-            duration_sec, _ = merge_audio_files(file_paths, output_path, gap_sec=gap_sec)
+                logger.info(
+                    f"[Auto-Merge] Batch {batch_id} finished! Merging {len(completed_tasks)} tasks with gap {gap_sec}s..."
+                )
+                duration_sec, _ = merge_audio_files(file_paths, output_path, gap_sec=gap_sec)
 
-            audio_url = f"/api/audio/output_{output_filename}"
-            title = f"Gộp Batch ({len(completed_tasks)} đoạn, {duration_sec:.1f}s, gap {gap_sec}s)"
+                audio_url = f"/api/audio/output_{output_filename}"
+                title = f"Gộp Batch ({len(completed_tasks)} đoạn, {duration_sec:.1f}s, gap {gap_sec}s)"
 
-            # Merge SRT for the entire batch
-            batch_srt_paths = []
-            batch_durs = []
-            for t in completed_tasks:
-                s_fn = t.get("srt_filename") or (t["filename"].rsplit(".", 1)[0] + ".srt")
-                s_fp = OUTPUTS_DIR / s_fn
-                if s_fp.exists():
-                    batch_srt_paths.append(str(s_fp))
-                    batch_durs.append(float(t.get("duration_sec") or 0.0))
+                # Merge SRT for the entire batch
+                batch_srt_paths = []
+                batch_durs = []
+                for t in completed_tasks:
+                    s_fn = t.get("srt_filename") or (t["filename"].rsplit(".", 1)[0] + ".srt")
+                    s_fp = OUTPUTS_DIR / s_fn
+                    if s_fp.exists():
+                        batch_srt_paths.append(str(s_fp))
+                        batch_durs.append(float(t.get("duration_sec") or 0.0))
 
-            if batch_srt_paths and len(batch_srt_paths) == len(batch_durs):
-                try:
-                    batch_srt_filename = f"merged_{batch_id}.srt"
-                    batch_srt_path = OUTPUTS_DIR / batch_srt_filename
-                    merge_srt_files(batch_srt_paths, batch_durs, str(batch_srt_path), gap_sec=gap_sec)
-                except Exception as srt_e:
-                    logger.warning(f"Failed to merge batch SRT for {batch_id}: {srt_e}")
+                if batch_srt_paths and len(batch_srt_paths) == len(batch_durs):
+                    try:
+                        batch_srt_filename = f"merged_{batch_id}.srt"
+                        batch_srt_path = OUTPUTS_DIR / batch_srt_filename
+                        merge_srt_files(batch_srt_paths, batch_durs, str(batch_srt_path), gap_sec=gap_sec)
+                    except Exception as srt_e:
+                        logger.warning(f"Failed to merge batch SRT for {batch_id}: {srt_e}")
 
-            save_merged_batch(
-                batch_id=batch_id,
-                title=title,
-                audio_url=audio_url,
-                filename=output_filename,
-                duration_sec=duration_sec,
-                chunks_count=len(completed_tasks),
-                gap_sec=gap_sec,
-            )
-            logger.info(
-                f"[Auto-Merge] Batch {batch_id} successfully merged -> {output_filename} (duration: {duration_sec:.2f}s)"
-            )
+                save_merged_batch(
+                    batch_id=batch_id,
+                    title=title,
+                    audio_url=audio_url,
+                    filename=output_filename,
+                    duration_sec=duration_sec,
+                    chunks_count=len(completed_tasks),
+                    gap_sec=gap_sec,
+                )
+                logger.info(
+                    f"[Auto-Merge] Batch {batch_id} successfully merged -> {output_filename} (duration: {duration_sec:.2f}s)"
+                )
 
-            # Delete chunk audio and SRT files once batch merge is complete
-            keep_list = [output_filename]
-            if batch_srt_paths and len(batch_srt_paths) == len(batch_durs):
-                keep_list.append(batch_srt_filename)
-            del_count = delete_chunk_files(completed_tasks, keep_files=keep_list)
-            logger.info(
-                f"[Auto-Merge] Cleaned up {del_count} chunk files for Batch {batch_id}."
-            )
-        except Exception as e:
-            logger.error(f"Error checking/performing auto-merge for Batch {batch_id}: {e}", exc_info=True)
+                # Delete chunk audio and SRT files once batch merge is complete
+                keep_list = [output_filename]
+                if batch_srt_paths and len(batch_srt_paths) == len(batch_durs):
+                    keep_list.append(batch_srt_filename)
+                del_count = delete_chunk_files(completed_tasks, keep_files=keep_list)
+                logger.info(
+                    f"[Auto-Merge] Cleaned up {del_count} chunk files for Batch {batch_id}."
+                )
+            except Exception as e:
+                logger.error(f"Error checking/performing auto-merge for Batch {batch_id}: {e}", exc_info=True)
