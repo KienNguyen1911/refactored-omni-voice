@@ -61,24 +61,27 @@ class VoiceStore:
             wav = load_audio(str(audio_path), model.sampling_rate)
             duration = wav.shape[-1] / model.sampling_rate
 
-            if duration > 15.0:
-                # Trim to ~5-10s at silence boundary to prevent VRAM explosion
+            # Discard any known placeholder / dragon text in ref_text
+            if ref_text:
+                lower_ref = ref_text.lower()
+                if any(k in lower_ref for k in ("eldoria", "zephyros", "burn it all down", "[sarcastically]", "[giggles]", "[whispers]", "dragon")):
+                    ref_text = None
+
+            if duration > 12.0:
+                # Trim to ~5-8s at silence boundary for optimal prompt quality and low VRAM
                 wav_trimmed = trim_long_audio(
                     wav,
                     model.sampling_rate,
-                    max_duration=10.0,
+                    max_duration=8.0,
                     min_duration=3.0,
-                    trim_threshold=12.0,
+                    trim_threshold=10.0,
                 )
                 audio_input = (wav_trimmed, model.sampling_rate)
-                # If audio was trimmed from a long file, let Whisper transcribe the trimmed clip
-                # unless user provided a very short transcript that already fits
+                # Let Whisper transcribe the exact trimmed clip
                 text_input = None
-                if ref_text and len(ref_text.strip().split()) <= 15:
-                    text_input = ref_text.strip()
             else:
                 audio_input = str(audio_path)
-                text_input = ref_text.strip() if ref_text else None
+                text_input = ref_text.strip() if ref_text and ref_text.strip() else None
 
             prompt = model.create_voice_clone_prompt(
                 ref_audio=audio_input,

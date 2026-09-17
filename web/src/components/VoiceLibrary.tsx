@@ -42,6 +42,7 @@ interface VoiceLibraryProps {
 }
 
 export const POPULAR_VOICE_SAMPLES = [
+  { flag: "🇺🇸", lang: "Tiếng Anh (US)", name: "Tyler (Conversational)", voiceId: "l1ejpIf72DWHJzwAiw4n", langCode: "en" },
   { flag: "🇻🇳", lang: "Tiếng Việt", name: "Daniel (Việt Nam)", voiceId: "xAVsdcJvD1uegu8lFEE2", langCode: "vi" },
   { flag: "🇬🇧", lang: "Tiếng Anh (UK)", name: "Russell (Narrator)", voiceId: "NYC9WEgkq1u4jiqBseQ9", langCode: "en" },
   { flag: "🇺🇸", lang: "Tiếng Anh (US)", name: "Daniel (English)", voiceId: "xAVsdcJvD1uegu8lFEE2", langCode: "en" },
@@ -150,7 +151,7 @@ export default function VoiceLibrary({
       setElevenLabsInfo(info);
       setGender(info.gender || "Unspecified");
       setDescription(info.description || "");
-      setRefText(info.ref_text || "");
+      setRefText(""); // Leave empty for high-precision Whisper AI auto-transcription
 
       let chosenPreviewUrl = info.preview_url;
       let chosenLanguage = info.language || "Auto";
@@ -882,6 +883,7 @@ export default function VoiceLibrary({
                                   setSelectedLangCode(item.code);
                                   setLanguage(item.label);
                                   setName(`${elevenLabsInfo.name} (${item.label})`);
+                                  setRefText(""); // Reset refText for new language preview
                                   if (isPlayingPreview) {
                                     togglePlayPreview(item.preview_url);
                                   }
@@ -950,12 +952,13 @@ export default function VoiceLibrary({
 
                     <div className="space-y-1">
                       <label className="text-xs font-medium text-slate-300 flex items-center justify-between">
-                        <span>Đoạn transcript mẫu (Ref Text)</span>
-                        <span className="text-[10px] text-emerald-400 font-mono">Tự động trích xuất</span>
+                        <span>Văn bản mẫu (Ref Text)</span>
+                        <span className="text-[10px] text-emerald-400 font-mono">Whisper AI tự nhận diện</span>
                       </label>
                       <textarea
                         value={refText}
                         onChange={(e) => setRefText(e.target.value)}
+                        placeholder="Để trống để hệ thống tự động nhận diện chính xác qua Whisper AI (Khuyên dùng)"
                         rows={2}
                         className="w-full p-2.5 rounded bg-[#08090b] border border-[#1e222b] text-slate-200 text-xs focus:outline-none focus:border-amber-500 font-sans resize-none"
                       />

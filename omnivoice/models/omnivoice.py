@@ -72,6 +72,7 @@ from omnivoice.utils.lang_map import LANG_IDS, LANG_NAMES
 from omnivoice.utils.text import (
     add_punctuation,
     chunk_text_punctuation,
+    map_and_clean_emotion_tags,
     normalize_text as _normalize_text,
 )
 from omnivoice.utils.voice_design import (
@@ -1075,6 +1076,9 @@ class OmniVoice(PreTrainedModel):
 
         language_list = self._ensure_list(language, batch_size)
         language_list = [_resolve_language(lang) for lang in language_list]
+
+        # Clean and map emotion tags (e.g. [giggles] -> [laughter], strip unsupported [sarcastically])
+        text_list = [map_and_clean_emotion_tags(t) for t in text_list]
 
         # Optional text normalization (opt-in). Applied to the target text only
         # (not ref_text, which must stay aligned with the reference audio),

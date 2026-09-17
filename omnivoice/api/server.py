@@ -276,6 +276,19 @@ def clone_elevenlabs_voice_endpoint(req: ElevenLabsCloneRequest):
             description = description if description is not None else info["description"]
             ref_text = ref_text if ref_text is not None else info["ref_text"]
 
+        # Sanitize ref_text: discard fake playground texts (e.g. Zephyros/Eldoria dragon story)
+        if ref_text:
+            cleaned_ref = ref_text.lower()
+            if any(k in cleaned_ref for k in ("eldoria", "zephyros", "burn it all down", "[sarcastically]", "[giggles]", "[whispers]", "dragon")):
+                logger.info("Discarding placeholder ElevenLabs playground text in ref_text.")
+                ref_text = None
+            elif not ref_text.strip():
+                ref_text = None
+            else:
+                ref_text = ref_text.strip()
+        else:
+            ref_text = None
+
         logger.info(f"Downloading ElevenLabs audio for voice '{name}' from {preview_url}...")
         audio_bytes = download_elevenlabs_audio(preview_url)
 
@@ -288,7 +301,7 @@ def clone_elevenlabs_voice_endpoint(req: ElevenLabsCloneRequest):
             gender=gender or "Unspecified",
             language=language or "Auto",
             description=(description or "").strip(),
-            ref_text=(ref_text or "").strip() or None,
+            ref_text=ref_text,
             model=model,
         )
         return new_voice

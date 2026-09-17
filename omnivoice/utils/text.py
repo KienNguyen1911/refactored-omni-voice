@@ -427,3 +427,106 @@ def normalize_text(text: str, language: Optional[str] = None) -> str:
     return _apply_with_protection(
         text, lambda s: _num2words_segment(s, code), protect_pinyin=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Emotion & Non-verbal Tag Normalization
+# ---------------------------------------------------------------------------
+
+NATIVE_NONVERBAL_TAGS = frozenset({
+    "laughter",
+    "sigh",
+    "confirmation-en",
+    "question-en",
+    "question-ah",
+    "question-oh",
+    "question-ei",
+    "question-yi",
+    "surprise-ah",
+    "surprise-oh",
+    "surprise-wa",
+    "surprise-yo",
+    "dissatisfaction-hnn",
+})
+
+EMOTION_TAG_MAPPINGS = {
+    # Laughter / Giggles
+    "giggles": "laughter",
+    "giggle": "laughter",
+    "chuckle": "laughter",
+    "chuckles": "laughter",
+    "laugh": "laughter",
+    "laughs": "laughter",
+    "cười": "laughter",
+    "cuoi": "laughter",
+    # Sighs
+    "sighs": "sigh",
+    "thở dài": "sigh",
+    "tho dai": "sigh",
+    # Surprises
+    "gasp": "surprise-oh",
+    "gasps": "surprise-oh",
+    "wow": "surprise-wa",
+    "ngạc nhiên": "surprise-oh",
+    "ngac nhien": "surprise-oh",
+    # Confirmation / Agreement
+    "confirmation": "confirmation-en",
+    "hmm": "confirmation-en",
+    "uh-huh": "confirmation-en",
+    "ừm": "confirmation-en",
+    "um": "confirmation-en",
+    "ờ": "confirmation-en",
+    # Question / Inquiring
+    "question": "question-en",
+    "huh": "question-en",
+    "hả": "question-en",
+    # Dissatisfaction
+    "hnn": "dissatisfaction-hnn",
+    "cằn nhằn": "dissatisfaction-hnn",
+}
+
+PAUSE_TAGS = frozenset({"pause", "pause:short", "pause:long", "silence", "nghỉ", "nghi"})
+
+
+def map_and_clean_emotion_tags(text: str) -> str:
+    """Map external emotion/action tags (from ElevenLabs or ChatGPT) to OmniVoice native tags.
+
+    - Translates compatible tags (e.g. [giggles] -> [laughter], [sighs] -> [sigh]).
+    - Converts pause tags (e.g. [pause]) to ellipsis for natural speech rhythm.
+    - Strips unsupported bracketed stage directions (e.g. [sarcastically], [whispers], [shouting])
+      so the TTS model does not awkwardly pronounce English action descriptions aloud.
+    - Leaves native OmniVoice tags ([laughter], [sigh], [surprise-oh], etc.) intact.
+    """
+    if not text:
+        return text
+
+    def _replace_tag(match):
+        raw_tag = match.group(1).strip()
+        lower_tag = raw_tag.lower()
+
+        # 1. Native OmniVoice tag? Keep it as is
+        if lower_tag in NATIVE_NONVERBAL_TAGS:
+            return f"[{lower_tag}]"
+
+        # 2. Known mapped tag? (e.g. giggles -> laughter)
+        if lower_tag in EMOTION_TAG_MAPPINGS:
+            mapped = EMOTION_TAG_MAPPINGS[lower_tag]
+            return f"[{mapped}]"
+
+        # 3. Pause tag? (e.g. [pause] -> ...)
+        if lower_tag in PAUSE_TAGS:
+            return " ... "
+
+        # 4. CMU pronunciation override? (e.g. [B EY1 S]) - keep if all uppercase phonemes
+        if all(part.isupper() or part.isdigit() for part in raw_tag.split()):
+            return match.group(0)
+
+        # 5. Unsupported stage direction (e.g. [sarcastically], [whispers], [crying])
+        # Strip the tag to prevent model from speaking "bracket sarcastically bracket"
+        return " "
+
+    # Match bracketed tags: [something]
+    cleaned = re.sub(r"\[([a-zA-Z0-9_\-:\sáàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵ]+)\]", _replace_tag, text)
+    # Collapse multiple spaces
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    return cleaned.strip()

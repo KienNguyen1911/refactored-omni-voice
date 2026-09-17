@@ -133,22 +133,11 @@ def fetch_elevenlabs_voice_info(voice_url_or_id: str, timeout: float = 15.0) -> 
         if nm:
             name = nm.group(1)
 
-    # Transcript / Sample text (initialText in TTS omnibox)
-    init_match = re.search(r'"initialText":"([^"]+)"', unescaped)
-    if init_match:
-        raw_text = init_match.group(1)
-        try:
-            ref_text = (
-                raw_text.encode("utf-8")
-                .decode("unicode_escape")
-                .encode("latin1")
-                .decode("utf-8")
-            )
-        except Exception:
-            try:
-                ref_text = raw_text.encode("latin1").decode("unicode_escape")
-            except Exception:
-                ref_text = raw_text
+    # NOTE: ElevenLabs 'initialText' is only placeholder text for their demo playground
+    # (e.g. the Zephyros dragon story) and DOES NOT match the spoken content of preview_url.
+    # Leave ref_text empty so the system automatically and accurately transcribes the downloaded
+    # preview audio using Whisper ASR.
+    ref_text = ""
 
     # Gender inference from description
     desc_lower = description.lower()

@@ -40,13 +40,13 @@ interface VoiceCloneStudioProps {
 }
 
 const NON_VERBAL_TAGS = [
-  { tag: "[laughter]", label: "laughter (cười)" },
-  { tag: "[sigh]", label: "sigh (thở dài)" },
-  { tag: "[surprise-wa]", label: "surprise-wa (ngạc nhiên)" },
-  { tag: "[surprise-oh]", label: "surprise-oh (ồ!)" },
-  { tag: "[surprise-ah]", label: "surprise-ah (à!)" },
-  { tag: "[confirmation-en]", label: "confirm-en (ừm)" },
-  { tag: "[dissatisfaction-hnn]", label: "hnn (hừm)" },
+  { tag: "[laughter]", label: "Cười", emoji: "😄", desc: "Tiếng cười vui vẻ / tự động khớp [giggles]" },
+  { tag: "[sigh]", label: "Thở dài", emoji: "😮‍💨", desc: "Tiếng thở dài / tự động khớp [sighs]" },
+  { tag: "[surprise-oh]", label: "Ngạc nhiên", emoji: "😲", desc: "Cảm thán ngạc nhiên (Ồ!)" },
+  { tag: "[surprise-ah]", label: "À ra thế", emoji: "💡", desc: "Tiếng nhận ra (À!)" },
+  { tag: "[confirmation-en]", label: "Ừm đồng ý", emoji: "🤝", desc: "Tiếng ừm khẳng định tự nhiên" },
+  { tag: "[dissatisfaction-hnn]", label: "Hừm...", emoji: "🤔", desc: "Tiếng hừm phân vân" },
+  { tag: "...", label: "Nghỉ nhịp", emoji: "⏸️", desc: "Khoảng nghỉ hơi tự nhiên" },
 ];
 
 export default function VoiceCloneStudio({
@@ -81,6 +81,10 @@ export default function VoiceCloneStudio({
   const [splitSuccessInfo, setSplitSuccessInfo] = useState<string | null>(null);
   const [queueSuccessMsg, setQueueSuccessMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Textarea references for precise cursor insertion
+  const singleTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const batchTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Reference voice preview player
   const [isPlayingRef, setIsPlayingRef] = useState(false);
@@ -129,10 +133,28 @@ export default function VoiceCloneStudio({
   };
 
   const insertTag = (tag: string) => {
-    if (mode === "single") {
-      setText((prev) => prev + " " + tag + " ");
+    const targetEl = mode === "single" ? singleTextareaRef.current : batchTextareaRef.current;
+    if (targetEl) {
+      const start = targetEl.selectionStart ?? targetEl.value.length;
+      const end = targetEl.selectionEnd ?? targetEl.value.length;
+      const val = targetEl.value;
+      const insertion = ` ${tag} `;
+      const nextVal = val.substring(0, start) + insertion + val.substring(end);
+      if (mode === "single") {
+        setText(nextVal);
+      } else {
+        setBatchText(nextVal);
+      }
+      setTimeout(() => {
+        targetEl.focus();
+        targetEl.setSelectionRange(start + insertion.length, start + insertion.length);
+      }, 10);
     } else {
-      setBatchText((prev) => prev + " " + tag + " ");
+      if (mode === "single") {
+        setText((prev) => (prev ? prev + " " + tag + " " : tag + " "));
+      } else {
+        setBatchText((prev) => (prev ? prev + " " + tag + " " : tag + " "));
+      }
     }
   };
 
@@ -326,10 +348,39 @@ export default function VoiceCloneStudio({
             </button>
           </div>
 
+          {/* Emotion & Expression Tag Toolbar */}
+          <div className="shrink-0 flex items-center justify-between gap-1.5 flex-wrap bg-[#08090b] px-2.5 py-1.5 rounded-md border border-[#1a1d24]">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-[11px] font-medium text-amber-400/90 flex items-center gap-1 mr-0.5 shrink-0">
+                <Sparkles className="w-3 h-3 text-amber-400" />
+                <span>Chèn biểu cảm:</span>
+              </span>
+              {NON_VERBAL_TAGS.map((item) => (
+                <button
+                  key={item.tag}
+                  type="button"
+                  onClick={() => insertTag(item.tag)}
+                  title={`${item.desc} (Click để chèn vào vị trí con trỏ)`}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-[#14171f] hover:bg-[#1f2433] hover:text-white text-slate-300 border border-[#232836] hover:border-amber-500/40 transition-colors cursor-pointer"
+                >
+                  <span>{item.emoji}</span>
+                  <span>{item.label}</span>
+                </button>
+              ))}
+            </div>
+            <span
+              className="text-[10px] text-slate-500 hidden md:inline-block font-mono"
+              title="Tự động tương thích với các thẻ ElevenLabs như [giggles], [sighs], [pause]"
+            >
+              💡 Tương thích thẻ ElevenLabs [giggles], [sighs]
+            </span>
+          </div>
+
           {/* Textarea Area (Takes remaining vertical height, scrolls internally if long) */}
           {mode === "single" ? (
             <div className="flex-1 min-h-0 flex flex-col space-y-1">
               <textarea
+                ref={singleTextareaRef}
                 value={text}
                 onChange={(e) => setText(e.target.value)}
                 placeholder="Nhập hoặc dán nội dung kịch bản cần đọc tại đây..."
@@ -373,6 +424,7 @@ export default function VoiceCloneStudio({
               </div>
 
               <textarea
+                ref={batchTextareaRef}
                 value={batchText}
                 onChange={(e) => setBatchText(e.target.value)}
                 placeholder="Dán văn bản dài vào đây. Mỗi dòng là 1 phân đoạn độc lập..."
